@@ -1,0 +1,6 @@
+/target/
+/checkpoints/
+*.pt
+*.pth
+*.safetensors
+!.gitkeep
