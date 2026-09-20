@@ -20,6 +20,7 @@ pub struct PromptEncoder {
     image_embedding_size: (usize, usize),
     input_image_size: (usize, usize),
     pe_layer: PositionEmbeddingRandom,
+    cached_dense_pe: Option<Tensor>,
     point_embeddings: [Tensor; 4],
     not_a_point_embed: Tensor,
     mask_conv_0: Conv2d,
@@ -33,14 +34,29 @@ pub struct PromptEncoder {
 impl PromptEncoder {
     pub fn load(config: &Sam2Config, vb: VarBuilder) -> Result<Self> {
         let mask_channels = 16;
+        let image_embedding_size = (
+            config.image_size / config.backbone_stride,
+            config.image_size / config.backbone_stride,
+        );
+        let pe_layer = PositionEmbeddingRandom::load(config.hidden_dim / 2, vb.pp("pe_layer"))?;
+        let no_mask_embed = vb.get((1, config.hidden_dim), "no_mask_embed.weight")?;
+        let cached_dense_pe = if no_mask_embed.device().is_cpu()
+            && std::env::var_os("SAM2_CPU_CACHE_DENSE_PE").is_none_or(|value| value != "0")
+        {
+            Some(
+                pe_layer
+                    .forward(image_embedding_size.0, image_embedding_size.1)?
+                    .unsqueeze(0)?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             embed_dim: config.hidden_dim,
-            image_embedding_size: (
-                config.image_size / config.backbone_stride,
-                config.image_size / config.backbone_stride,
-            ),
+            image_embedding_size,
             input_image_size: (config.image_size, config.image_size),
-            pe_layer: PositionEmbeddingRandom::load(config.hidden_dim / 2, vb.pp("pe_layer"))?,
+            pe_layer,
+            cached_dense_pe,
             point_embeddings: [
                 vb.pp("point_embeddings.0")
                     .get((1, config.hidden_dim), "weight")?,
@@ -81,11 +97,14 @@ impl PromptEncoder {
                 Conv2dConfig::default(),
                 vb.pp("mask_downscaling.6"),
             )?,
-            no_mask_embed: vb.get((1, config.hidden_dim), "no_mask_embed.weight")?,
+            no_mask_embed,
         })
     }
 
     pub fn get_dense_pe(&self) -> Result<Tensor> {
+        if let Some(cached) = &self.cached_dense_pe {
+            return Ok(cached.clone());
+        }
         self.pe_layer
             .forward(self.image_embedding_size.0, self.image_embedding_size.1)?
             .unsqueeze(0)

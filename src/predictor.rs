@@ -1,14 +1,14 @@
 //! Public static-image SAM2 predictor.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::{
     BackboneOutput, ImageEncoder, ImageEncoderProfile, MaskDecoder, MaskDecoderOutput,
-    PromptEncoder, Sam2Base, Sam2Config, Sam2FrameOutput, Sam2ImageTransforms, Sam2Variant,
-    VideoInferenceState,
+    MaskDecoderProfile, PromptEncoder, Sam2Base, Sam2Config, Sam2FrameOutput, Sam2ImageTransforms,
+    Sam2Variant, VideoInferenceState,
 };
 
 /// A point in pixel coordinates in the model's 1024x1024 input space.
@@ -403,6 +403,9 @@ impl Sam2ImagePredictor {
         path: impl AsRef<Path>,
         device: &Device,
     ) -> Result<Self> {
+        if device.is_cpu() {
+            crate::cpu_allocator::configure_cpu_allocator_for_inference();
+        }
         let path = path.as_ref();
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device) }?;
         let config = Sam2Config::sam2_1(variant);
@@ -430,7 +433,17 @@ impl Sam2ImagePredictor {
     /// Encodes an already-normalized image once. Reuse the returned features
     /// for multiple prompt decodes and for component-level performance probes.
     pub fn encode_image(&self, image: &Tensor) -> Result<BackboneOutput> {
-        self.image_encoder.forward(image)
+        let mut features = self.image_encoder.forward(image)?;
+        if self.device.is_cpu()
+            && std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
+                .is_none_or(|value| value != "0")
+        {
+            features.sam_high_res_features = Some(
+                self.mask_decoder
+                    .project_high_res_features(&features.backbone_fpn[..2])?,
+            );
+        }
+        Ok(features)
     }
 
     /// Encodes an image with synchronized Hiera/FPN timings for optimization work.
@@ -438,7 +451,17 @@ impl Sam2ImagePredictor {
         &self,
         image: &Tensor,
     ) -> Result<(BackboneOutput, ImageEncoderProfile)> {
-        self.image_encoder.forward_profiled(image)
+        let (mut features, profile) = self.image_encoder.forward_profiled(image)?;
+        if self.device.is_cpu()
+            && std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
+                .is_none_or(|value| value != "0")
+        {
+            features.sam_high_res_features = Some(
+                self.mask_decoder
+                    .project_high_res_features(&features.backbone_fpn[..2])?,
+            );
+        }
+        Ok((features, profile))
     }
 
     /// As [`Self::predict`], with an optional low-resolution mask-logit prompt
@@ -508,14 +531,95 @@ impl Sam2ImagePredictor {
             box_tensor.as_ref(),
             mask_input,
         )?;
-        self.mask_decoder.forward(
-            &features.vision_features,
-            &self.prompt_encoder.get_dense_pe()?,
-            &prompts.sparse_embeddings,
-            &prompts.dense_embeddings,
-            multimask_output,
-            &features.backbone_fpn[..2],
-        )
+        let dense_pe = self.prompt_encoder.get_dense_pe()?;
+        if let Some(high_res_features) = &features.sam_high_res_features {
+            self.mask_decoder.forward_preprojected(
+                &features.vision_features,
+                &dense_pe,
+                &prompts.sparse_embeddings,
+                &prompts.dense_embeddings,
+                multimask_output,
+                high_res_features,
+            )
+        } else {
+            self.mask_decoder.forward(
+                &features.vision_features,
+                &dense_pe,
+                &prompts.sparse_embeddings,
+                &prompts.dense_embeddings,
+                multimask_output,
+                &features.backbone_fpn[..2],
+            )
+        }
+    }
+
+    /// Decoder-only companion to [`Self::decode_image_features`] for stable
+    /// CPU performance investigation.
+    pub fn decode_image_features_profiled(
+        &self,
+        features: &BackboneOutput,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        multimask_output: bool,
+    ) -> Result<(MaskDecoderOutput, MaskDecoderProfile)> {
+        let prompt_start = Instant::now();
+        let point_tensor = (!points.is_empty())
+            .then(|| {
+                Tensor::from_vec(
+                    points.iter().flat_map(|p| [p.x, p.y]).collect::<Vec<_>>(),
+                    (1, points.len(), 2usize),
+                    &self.device,
+                )
+            })
+            .transpose()?;
+        let label_tensor = (!points.is_empty())
+            .then(|| {
+                Tensor::from_vec(
+                    points
+                        .iter()
+                        .map(|p| i64::from(p.positive))
+                        .collect::<Vec<_>>(),
+                    (1, points.len()),
+                    &self.device,
+                )
+            })
+            .transpose()?;
+        let box_tensor = bounding_box
+            .map(|b| Tensor::from_vec(vec![b.x0, b.y0, b.x1, b.y1], (1, 4usize), &self.device))
+            .transpose()?;
+        let prompts = self.prompt_encoder.forward(
+            point_tensor.as_ref().zip(label_tensor.as_ref()),
+            box_tensor.as_ref(),
+            mask_input,
+        )?;
+        let prompt_encoder_ms = prompt_start.elapsed().as_secs_f64() * 1000.;
+        let dense_pe_start = Instant::now();
+        let dense_pe = self.prompt_encoder.get_dense_pe()?;
+        let dense_pe_ms = dense_pe_start.elapsed().as_secs_f64() * 1000.;
+        let (output, mut profile) = if let Some(high_res_features) = &features.sam_high_res_features
+        {
+            self.mask_decoder.forward_profiled_preprojected(
+                &features.vision_features,
+                &dense_pe,
+                &prompts.sparse_embeddings,
+                &prompts.dense_embeddings,
+                multimask_output,
+                high_res_features,
+            )?
+        } else {
+            self.mask_decoder.forward_profiled(
+                &features.vision_features,
+                &dense_pe,
+                &prompts.sparse_embeddings,
+                &prompts.dense_embeddings,
+                multimask_output,
+                &features.backbone_fpn[..2],
+            )?
+        };
+        profile.prompt_encoder_ms = prompt_encoder_ms;
+        profile.dense_pe_ms = dense_pe_ms;
+        Ok((output, profile))
     }
 
     /// Convenience API for interleaved RGB8 pixels in original image

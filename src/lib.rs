@@ -6,6 +6,7 @@
 
 pub mod checkpoint;
 pub mod config;
+mod cpu_allocator;
 pub mod error;
 pub mod modeling;
 pub mod ops;
@@ -18,9 +19,9 @@ pub use config::{HieraConfig, Sam2Config, Sam2Variant};
 pub use error::{Error, Result};
 pub use modeling::{
     Attention, BackboneOutput, FpnNeck, Hiera, HieraProfile, ImageEncoder, ImageEncoderProfile,
-    MaskDecoder, MaskDecoderOutput, MemoryAttention, MemoryEncoder, MemoryEncoderOutput,
-    PromptEncoder, PromptEncoderOutput, RopeAttention, Sam2Base, Sam2FrameOutput,
-    TwoWayTransformer,
+    MaskDecoder, MaskDecoderOutput, MaskDecoderProfile, MemoryAttention, MemoryEncoder,
+    MemoryEncoderOutput, PromptEncoder, PromptEncoderOutput, RopeAttention, Sam2Base,
+    Sam2FrameOutput, TwoWayTransformer, TwoWayTransformerProfile,
 };
 pub use predictor::{
     AutomaticMask, AutomaticMaskConfig, BoxPrompt, ImagePrediction, MaskRle, PointPrompt,

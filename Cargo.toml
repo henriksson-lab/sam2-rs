@@ -15,6 +15,7 @@ candle-core = { path = "/home/mahogny/github/claude/candle/candle-core" }
 candle-nn = { path = "/home/mahogny/github/claude/candle/candle-nn" }
 safetensors = "0.8.0"
 thiserror = "2"
+rayon = "1.11"
 
 [dev-dependencies]
 tempfile = "3"
@@ -26,3 +27,9 @@ default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-core/cudnn", "candle-nn/cudnn"]
 # Optional CPU BLAS path for a separately labelled CPU experiment.
 mkl = ["candle-core/mkl", "candle-nn/mkl"]
+# Experimental: route long Hiera CPU attention through Candle's fused f32
+# online-softmax implementation. Benchmarked separately from the default.
+cpu-flash-attention = []
+# Linux/x86-64 experiment: enable Candle's glibc 2.35+ AVX-512 vector exact
+# GELU. Kept explicit because it is a system-ABI dependency, not portable.
+cpu-glibc-vector-math = ["candle-core/glibc-vector-math", "candle-nn/glibc-vector-math"]

@@ -4,6 +4,7 @@ use std::f64::consts::PI;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
+use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct PositionEmbeddingSine {
@@ -38,6 +39,19 @@ impl PositionEmbeddingSine {
     }
 
     pub fn pe(&self, batch: usize, height: usize, width: usize, device: &Device) -> Result<Tensor> {
+        if device.is_cpu() {
+            return self.pe_cpu_f32(batch, height, width, device);
+        }
+        self.pe_generic(batch, height, width, device)
+    }
+
+    fn pe_generic(
+        &self,
+        batch: usize,
+        height: usize,
+        width: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
         let y = Tensor::arange(1f32, height as f32 + 1., device)?
             .reshape((1, height, 1))?
             .broadcast_as((batch, height, width))?;
@@ -70,6 +84,78 @@ impl PositionEmbeddingSine {
         let pos_x = interleaved_sin_cos(&x.unsqueeze(3)?.broadcast_div(&dim_t)?)?;
         let pos_y = interleaved_sin_cos(&y.unsqueeze(3)?.broadcast_div(&dim_t)?)?;
         Tensor::cat(&[&pos_y, &pos_x], 3)?.permute((0, 3, 1, 2))
+    }
+
+    /// Fused CPU f32 position encoding. This writes the NCHW result directly
+    /// instead of materializing coordinate grids, feature divisions, indexed
+    /// trigonometric tensors, and their concatenation.
+    fn pe_cpu_f32(
+        &self,
+        batch: usize,
+        height: usize,
+        width: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let features = self.num_pos_feats;
+        let channels = features * 2;
+        let plane = height * width;
+        let denominator_y = if self.normalize {
+            height as f32 + 1e-6
+        } else {
+            1.
+        };
+        let denominator_x = if self.normalize {
+            width as f32 + 1e-6
+        } else {
+            1.
+        };
+        let scale = self.scale as f32;
+        let dim_t: Vec<f32> = (0..features)
+            .map(|index| {
+                self.temperature
+                    .powf(2. * (index / 2) as f64 / features as f64) as f32
+            })
+            .collect();
+        let mut output = vec![0f32; batch * channels * plane];
+        output.par_chunks_mut(plane).enumerate().for_each_init(
+            || vec![0f32; width],
+            |x_values, (channel_plane, output)| {
+                let channel = channel_plane % channels;
+                let (is_y, feature) = if channel < features {
+                    (true, channel)
+                } else {
+                    (false, channel - features)
+                };
+                let denominator = dim_t[feature];
+                let use_sin = feature % 2 == 0;
+                if is_y {
+                    for y in 0..height {
+                        let coordinate = if self.normalize {
+                            (y as f32 + 1.) / denominator_y * scale
+                        } else {
+                            y as f32 + 1.
+                        };
+                        let value = coordinate / denominator;
+                        let value = if use_sin { value.sin() } else { value.cos() };
+                        output[y * width..(y + 1) * width].fill(value);
+                    }
+                } else {
+                    for (x, output_value) in x_values.iter_mut().enumerate() {
+                        let coordinate = if self.normalize {
+                            (x as f32 + 1.) / denominator_x * scale
+                        } else {
+                            x as f32 + 1.
+                        };
+                        let angle = coordinate / denominator;
+                        *output_value = if use_sin { angle.sin() } else { angle.cos() };
+                    }
+                    for y in 0..height {
+                        output[y * width..(y + 1) * width].copy_from_slice(x_values);
+                    }
+                }
+            },
+        );
+        Tensor::from_vec(output, (batch, channels, height, width), device)
     }
 }
 
@@ -169,6 +255,22 @@ mod tests {
     use candle_nn::VarBuilder;
 
     use super::*;
+
+    #[test]
+    fn fused_sine_encoding_matches_generic_tensor_pipeline() {
+        let encoder = PositionEmbeddingSine::new(16, 10_000., true, None);
+        let device = Device::Cpu;
+        let fused = encoder.pe_cpu_f32(2, 7, 9, &device).unwrap();
+        let generic = encoder.pe_generic(2, 7, 9, &device).unwrap();
+        let fused = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let generic = generic.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_error = fused
+            .iter()
+            .zip(&generic)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0f32, f32::max);
+        assert!(max_error <= 1e-6, "max error {max_error}");
+    }
 
     #[test]
     fn random_dense_encoding_matches_python_reference() {

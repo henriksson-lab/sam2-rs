@@ -4,7 +4,7 @@ Native Candle-backed SAM2.1 inference with static, video/z-slice, automatic-mask
 
 ## Reproducible performance baseline
 
-Run `python3 tools/run_benchmarks.py` after following [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md). The generated table compares separate fresh CPU processes over an identical frozen real-image fixture; ratios below `1.0×` favor Rust.
+Run `python3 tools/run_benchmarks.py` after following [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md). The generated table compares separate fresh CPU processes over an identical frozen real-image fixture; ratios below `1.0×` favor Rust. Use `--threads N` to cap Rayon and PyTorch to the same CPU-worker count; this is required when comparing thread-count tuning.
 
 For CUDA, run `python3 tools/run_gpu_benchmarks.py` on a CUDA-capable host. It writes a separate table and synchronizes device work around each timing sample; its RSS column is host `VmHWM`, not VRAM.
 
@@ -42,3 +42,64 @@ error (`4.50611e-05`) and improved the default-Candle result as follows.
 | Image encoder | 10398.43 ms | 9349.32 ms | 0.899× |
 | Prompt encoder + mask decoder | 529.60 ms | 396.46 ms | 0.749× |
 | FPN | 776.81 ms | 576.28 ms | 0.742× |
+
+### SIMD CPU flash-attention diagnostic
+
+The local Candle commit `480dbc1b` adds a float32 AVX2/FMA online-softmax path
+for long attention. It is opt-in with `--features cpu-flash-attention`; the
+default remains available for comparison.
+
+| Metric | Fork default | SIMD flash feature | Feature/default |
+| --- | ---: | ---: | ---: |
+| Total static inference | 9758.35 ms | 7007.11 ms | 0.718× |
+| Image encoder | 9349.32 ms | 6569.83 ms | 0.703× |
+| Peak RSS | 1688.9 MiB | 661.4 MiB | 0.392× |
+| Max abs mask-logit error vs PyTorch | 4.50611e-05 | 5.00679e-05 | — |
+
+The feature is still `10.75×` the one-iteration PyTorch CPU diagnostic, but
+its three global-attention blocks fall from about 1.5 s each to 0.53–0.55 s.
+Reproduce the full ratio table with `python3 tools/run_benchmarks.py --rust-features cpu-flash-attention`.
+
+## Reproducible experimental performance baseline
+
+<!-- BENCHMARK_EXPERIMENTAL_RESULTS_START -->
+_Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz; fixture SHA-256: `24271176ecdc`. CPU workers: `20`, pinned to CPUs `0-19`. Peak RSS is Linux `VmHWM`._
+
+| Fixture / operation | Rust mean ms | Python mean ms | Rust/Python latency | Rust mean peak RSS MiB | Python mean peak RSS MiB | Rust/Python RSS | Max abs mask-logit error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bedroom/00089.jpg, Tiny static point prompt on cpu; Rust `cpu-flash-attention,cpu-glibc-vector-math` (8 independent runs × 5 measured iterations) | 580.06 | 652.42 | 0.889× | 629.6 | 1411.8 | 0.446× | 2.86102e-05 |
+<!-- BENCHMARK_EXPERIMENTAL_RESULTS_END -->
+
+This current-code row combines two four-run batches on the shared host. Their
+latency ratios were `0.891×` and `0.887×`; all eight individual Rust/PyTorch
+pairs favored Rust. The arithmetic mean is reproducible with the runner, but
+contention makes small cross-date changes inconclusive. CPU speed parity is
+reached for this fixture, machine, and 20-worker configuration, not established
+for every variant, prompt, or CPU. Use paired A/B measurements in
+[PERFORMANCE_INVESTIGATION.md](PERFORMANCE_INVESTIGATION.md) before attributing
+an optimization.
+Exact within-block decoder key/position reuse and image-time projection of
+high-resolution skips are included in this row. Their repeated-decode gains
+are measured, but paired full-model A/B runs have not established a clean
+gain under the shared host's varying load.
+The direct Hiera query-pool path is included in this row. Its paired
+full-model A/B averaged `0.967×` of the prior Rust path with byte-identical
+masks. An earlier attempted cross-runtime batch had a `6.58` s PyTorch
+contention outlier and was excluded; see
+[PERFORMANCE_INVESTIGATION.md](PERFORMANCE_INVESTIGATION.md).
+On Linux/glibc, loading a CPU model also sets glibc's mmap and trim thresholds
+to 256 MiB once per process. This keeps large temporary attention buffers on
+the heap and trades some peak RSS for speed. It has no effect on CUDA model
+loading. Set `SAM2_CPU_KEEP_LARGE_ALLOCATIONS=0` to opt out; existing
+`MALLOC_MMAP_THRESHOLD_` or `MALLOC_TRIM_THRESHOLD_` settings also take
+precedence. This tuning is process-global, so embedding applications should
+consider its effect on other allocations.
+Run `python3 tools/run_benchmarks.py --iterations 5 --repeats 4 --threads 20 --cpu-list 0-19 --rust-features cpu-flash-attention,cpu-glibc-vector-math --no-write`
+twice to collect the same number of independent runs.
+
+An earlier run before the tiny-query decoder change, with eight pinned CPU
+workers, measured 1190.83 ms Rust versus
+828.61 ms PyTorch (`1.437×`) across four independent runs of five iterations.
+Mean peak RSS was 588.2 MiB versus 1582.1 MiB (`0.372×`), with maximum
+mask-logit error `2.90871e-05`. Reproduce with
+`python3 tools/run_benchmarks.py --iterations 5 --repeats 4 --threads 8 --cpu-list 0-7 --rust-features cpu-flash-attention,cpu-glibc-vector-math --no-write`.

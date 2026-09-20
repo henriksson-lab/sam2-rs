@@ -47,14 +47,27 @@ fn main() -> ExitCode {
         .position(|arg| arg == "--profile-encoder")
         .map(|index| args.remove(index))
         .is_some();
+    let profile_decoder = args
+        .iter()
+        .position(|arg| arg == "--profile-decoder")
+        .map(|index| args.remove(index))
+        .is_some();
+    let decoder_only = args
+        .iter()
+        .position(|arg| arg == "--decoder-only")
+        .map(|index| args.remove(index))
+        .is_some();
     if args.len() < 2 {
         eprintln!(
-            "usage: bench-static <checkpoint.safetensors> <fixture.safetensors> [iterations] [output.f32] [--device cpu|cuda] [--profile-stages] [--profile-encoder]"
+            "usage: bench-static <checkpoint.safetensors> <fixture.safetensors> [iterations] [output.f32] [--device cpu|cuda] [--profile-stages] [--profile-encoder] [--profile-decoder] [--decoder-only]"
         );
         return ExitCode::from(2);
     }
     let iterations = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(3usize);
     let result = (|| -> candle_core::Result<()> {
+        if decoder_only && profile_encoder {
+            candle_core::bail!("--decoder-only cannot be combined with --profile-encoder")
+        }
         let device = match device_name.as_str() {
             "cpu" => Device::Cpu,
             "cuda" => Device::new_cuda(0)?,
@@ -71,33 +84,61 @@ fn main() -> ExitCode {
         };
         let _ = predictor.predict(&image, &[point], None, false)?;
         device.synchronize()?;
+        let decoder_features = if decoder_only {
+            Some(predictor.encode_image(&image)?)
+        } else {
+            None
+        };
+        device.synchronize()?;
         let mut samples = Vec::with_capacity(iterations);
         let mut last: Option<Tensor> = None;
         let mut stage_profile = None;
         let mut encoder_profile = None;
+        let mut decoder_profile = None;
         for iteration in 0..iterations {
             let start = Instant::now();
-            if (profile_stages || profile_encoder) && iteration == 0 {
+            if (profile_stages || profile_encoder || profile_decoder) && iteration == 0 {
                 let (features, profile) = if profile_encoder {
                     let (features, profile) = predictor.encode_image_profiled(&image)?;
                     (features, Some(profile))
+                } else if let Some(features) = &decoder_features {
+                    (features.clone(), None)
                 } else {
                     (predictor.encode_image(&image)?, None)
                 };
                 device.synchronize()?;
                 let encoder_ms = start.elapsed().as_secs_f64() * 1000.;
                 let decoder_start = Instant::now();
-                last = Some(
-                    predictor
-                        .decode_image_features(&features, &[point], None, None, false)?
-                        .masks,
-                );
+                if profile_decoder {
+                    let (output, profile) = predictor.decode_image_features_profiled(
+                        &features,
+                        &[point],
+                        None,
+                        None,
+                        false,
+                    )?;
+                    decoder_profile = Some(profile);
+                    last = Some(output.masks);
+                } else {
+                    last = Some(
+                        predictor
+                            .decode_image_features(&features, &[point], None, None, false)?
+                            .masks,
+                    );
+                }
                 device.synchronize()?;
                 if profile_stages {
                     stage_profile =
                         Some((encoder_ms, decoder_start.elapsed().as_secs_f64() * 1000.));
                 }
                 encoder_profile = profile;
+            } else if let Some(features) = &decoder_features {
+                last = Some(
+                    predictor
+                        .decode_image_features(features, &[point], None, None, false)?
+                        .masks,
+                );
+                device.synchronize()?;
             } else {
                 last = Some(predictor.predict(&image, &[point], None, false)?.masks);
                 device.synchronize()?;
@@ -115,16 +156,21 @@ fn main() -> ExitCode {
         }
         let checksum = output.sum_all()?.to_scalar::<f32>()?;
         let stage_fields = stage_profile.map_or_else(String::new, |(encoder_ms, decoder_ms)| {
-            format!("\",\"encoder_ms\":{encoder_ms:.6},\"decoder_ms\":{decoder_ms:.6}")
+            format!(",\"encoder_ms\":{encoder_ms:.6},\"decoder_ms\":{decoder_ms:.6}")
         });
         let encoder_fields = encoder_profile.map_or_else(String::new, |profile| {
             format!(
-                ",\"hiera_setup_ms\":{:.6},\"hiera_block_ms\":{:?},\"fpn_ms\":{:.6}",
-                profile.hiera_setup_ms, profile.hiera_block_ms, profile.fpn_ms
+                ",\"hiera_setup_ms\":{:.6},\"hiera_block_ms\":{:?},\"hiera_norm1_ms\":{:?},\"hiera_shortcut_ms\":{:?},\"hiera_shortcut_pool_ms\":{:?},\"hiera_partition_ms\":{:?},\"hiera_attention_ms\":{:?},\"hiera_attention_qkv_ms\":{:?},\"hiera_attention_qkv_views_ms\":{:?},\"hiera_attention_query_pool_ms\":{:?},\"hiera_attention_query_reshape_ms\":{:?},\"hiera_attention_query_pool_core_ms\":{:?},\"hiera_attention_kernel_ms\":{:?},\"hiera_attention_projection_ms\":{:?},\"hiera_attention_cleanup_ms\":{:?},\"hiera_attention_cleanup_attended_ms\":{:?},\"hiera_attention_cleanup_qkv_ms\":{:?},\"hiera_unpartition_ms\":{:?},\"hiera_residual_add_ms\":{:?},\"hiera_norm2_ms\":{:?},\"hiera_mlp_ms\":{:?},\"hiera_mlp_expansion_ms\":{:?},\"hiera_mlp_activation_ms\":{:?},\"hiera_mlp_projection_ms\":{:?},\"fpn_ms\":{:.6},\"fpn_lateral_ms\":{:?},\"fpn_top_down_ms\":{:?},\"fpn_position_ms\":{:?}",
+                profile.hiera_setup_ms, profile.hiera_block_ms, profile.hiera_norm1_ms, profile.hiera_shortcut_ms, profile.hiera_shortcut_pool_ms, profile.hiera_partition_ms, profile.hiera_attention_ms, profile.hiera_attention_qkv_ms, profile.hiera_attention_qkv_views_ms, profile.hiera_attention_query_pool_ms, profile.hiera_attention_query_reshape_ms, profile.hiera_attention_query_pool_core_ms, profile.hiera_attention_kernel_ms, profile.hiera_attention_projection_ms, profile.hiera_attention_cleanup_ms, profile.hiera_attention_cleanup_attended_ms, profile.hiera_attention_cleanup_qkv_ms, profile.hiera_unpartition_ms, profile.hiera_residual_add_ms, profile.hiera_norm2_ms, profile.hiera_mlp_ms, profile.hiera_mlp_expansion_ms, profile.hiera_mlp_activation_ms, profile.hiera_mlp_projection_ms, profile.fpn_ms, profile.fpn_lateral_ms, profile.fpn_top_down_ms, profile.fpn_position_ms
             )
         });
+        let decoder_fields = decoder_profile.map_or_else(String::new, |profile| format!(
+            ",\"decoder_prompt_encoder_ms\":{:.6},\"decoder_dense_pe_ms\":{:.6},\"decoder_token_setup_ms\":{:.6},\"decoder_transformer_ms\":{:.6},\"decoder_transformer_setup_ms\":{:.6},\"decoder_transformer_self_attention_ms\":{:?},\"decoder_transformer_token_to_image_ms\":{:?},\"decoder_transformer_mlp_ms\":{:?},\"decoder_transformer_image_to_token_ms\":{:?},\"decoder_transformer_final_attention_ms\":{:.6},\"decoder_cross_qkv_ms\":{:?},\"decoder_cross_kernel_ms\":{:?},\"decoder_cross_output_projection_ms\":{:?},\"decoder_cross_total_ms\":{:?},\"decoder_cross_pre_ms\":{:?},\"decoder_cross_post_ms\":{:?},\"decoder_upconv_0_ms\":{:.6},\"decoder_skip_1_ms\":{:.6},\"decoder_upconv_core_0_ms\":{:.6},\"decoder_upnorm_gelu_ms\":{:.6},\"decoder_upconv_3_ms\":{:.6},\"decoder_skip_0_ms\":{:.6},\"decoder_upconv_core_3_ms\":{:.6},\"decoder_final_gelu_ms\":{:.6},\"decoder_hypernetworks_ms\":{:.6},\"decoder_mask_projection_ms\":{:.6},\"decoder_heads_ms\":{:.6}",
+            profile.prompt_encoder_ms, profile.dense_pe_ms, profile.token_setup_ms, profile.transformer_ms, profile.transformer.setup_ms, profile.transformer.self_attention_ms, profile.transformer.token_to_image_attention_ms, profile.transformer.mlp_ms, profile.transformer.image_to_token_attention_ms, profile.transformer.final_attention_ms, profile.transformer.cross_qkv_ms, profile.transformer.cross_kernel_ms, profile.transformer.cross_output_projection_ms, profile.transformer.cross_total_ms, profile.transformer.cross_pre_ms, profile.transformer.cross_post_ms, profile.upconv_0_ms, profile.skip_1_ms, profile.upconv_core_0_ms, profile.upnorm_gelu_ms, profile.upconv_3_ms, profile.skip_0_ms, profile.upconv_core_3_ms, profile.final_gelu_ms, profile.hypernetworks_ms, profile.mask_projection_ms, profile.heads_ms
+        ));
         println!(
-            "{{\"implementation\":\"rust-candle\",\"device\":\"{device_name}\",\"iterations\":{iterations},\"median_ms\":{:.6},\"rss_hwm_kb\":{},\"mask_checksum\":{checksum:.8}{stage_fields}{encoder_fields}}}",
+            "{{\"implementation\":\"rust-candle\",\"device\":\"{device_name}\",\"scope\":\"{}\",\"iterations\":{iterations},\"median_ms\":{:.6},\"rss_hwm_kb\":{},\"mask_checksum\":{checksum:.8}{stage_fields}{encoder_fields}{decoder_fields}}}",
+            if decoder_only { "decoder" } else { "full" },
             median(samples),
             hwm_kb()
         );

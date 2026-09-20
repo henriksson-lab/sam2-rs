@@ -49,6 +49,7 @@ pub struct Sam2Base {
 
 impl Sam2Base {
     pub fn load_sam2_1(variant: Sam2Variant, path: impl AsRef<Path>) -> Result<Self> {
+        crate::cpu_allocator::configure_cpu_allocator_for_inference();
         let device = Device::Cpu;
         let config = Sam2Config::sam2_1(variant);
         let vb =
