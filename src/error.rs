@@ -18,6 +18,12 @@ pub enum Error {
         source: safetensors::SafeTensorError,
     },
 
+    #[error("could not parse PyTorch checkpoint {path}: {source}")]
+    PyTorch {
+        path: PathBuf,
+        source: candle_core::Error,
+    },
+
     #[error(
         "unsupported checkpoint format for {0}; convert the PyTorch state_dict to safetensors first"
     )]
@@ -32,6 +38,9 @@ pub enum Error {
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+
+    #[error("checkpoint manifest mismatch: {0}")]
+    CheckpointManifest(String),
 
     #[error("invalid SAM2 configuration: {0}")]
     InvalidConfig(String),

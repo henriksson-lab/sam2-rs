@@ -13,7 +13,7 @@ fn main() -> ExitCode {
         let generator = Sam2AutomaticMaskGenerator::load_sam2_1_hiera_tiny(
             path,
             AutomaticMaskConfig {
-                points_per_side: 1,
+                points_per_side: Some(1),
                 pred_iou_thresh: 0.,
                 stability_score_thresh: 0.,
                 use_m2m: true,

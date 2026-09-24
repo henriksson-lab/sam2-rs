@@ -3,11 +3,12 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder, conv2d, linear, ops::sigmoid};
+use candle_nn::{Conv2d, Conv2dConfig, Module, conv2d, linear, ops::sigmoid};
 
 use crate::{
-    BoxPrompt, ImageEncoder, MaskDecoder, MemoryAttention, MemoryEncoder, MemoryFrame, PointPrompt,
-    PromptEncoder, Sam2Config, Sam2Variant, VideoInferenceState,
+    BackboneOutput, BoxPrompt, ImageEncoder, MaskDecoder, MaskDecoderConfig, MemoryAttention,
+    MemoryEncoder, MemoryFrame, PointPrompt, PromptEncoder, Sam2Config, Sam2Variant,
+    VideoInferenceState,
     ops::{Activation, Mlp},
 };
 
@@ -49,17 +50,36 @@ pub struct Sam2Base {
 
 impl Sam2Base {
     pub fn load_sam2_1(variant: Sam2Variant, path: impl AsRef<Path>) -> Result<Self> {
-        crate::cpu_allocator::configure_cpu_allocator_for_inference();
+        Self::load_sam2_1_with_decoder_config(variant, path, MaskDecoderConfig::raw())
+    }
+
+    pub fn load_sam2_1_with_decoder_config(
+        variant: Sam2Variant,
+        path: impl AsRef<Path>,
+        decoder_config: MaskDecoderConfig,
+    ) -> Result<Self> {
         let device = Device::Cpu;
+        Self::load_sam2_1_on_device_with_decoder_config(variant, path, &device, decoder_config)
+    }
+
+    pub fn load_sam2_1_on_device_with_decoder_config(
+        variant: Sam2Variant,
+        path: impl AsRef<Path>,
+        device: &Device,
+        decoder_config: MaskDecoderConfig,
+    ) -> Result<Self> {
+        if device.is_cpu() {
+            crate::cpu_allocator::configure_cpu_allocator_for_inference();
+        }
         let config = Sam2Config::sam2_1(variant);
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[path.as_ref()], DType::F32, &device) }?;
+        crate::checkpoint::validate_sam2_1(path.as_ref(), variant)?;
+        let vb = crate::checkpoint::load_var_builder(path, DType::F32, device)?;
         Ok(Self {
             device: device.clone(),
             config: config.clone(),
             image_encoder: ImageEncoder::load(&config, vb.pp("image_encoder"))?,
             prompt_encoder: PromptEncoder::load(&config, vb.pp("sam_prompt_encoder"))?,
-            mask_decoder: MaskDecoder::load(vb.pp("sam_mask_decoder"))?,
+            mask_decoder: MaskDecoder::load_with_config(vb.pp("sam_mask_decoder"), decoder_config)?,
             memory_attention: MemoryAttention::load(vb.pp("memory_attention"))?,
             memory_encoder: MemoryEncoder::load(vb.pp("memory_encoder"))?,
             maskmem_tpos_enc: vb.get((config.num_maskmem, 1, 1, 64), "maskmem_tpos_enc")?,
@@ -87,6 +107,10 @@ impl Sam2Base {
             )?,
             obj_ptr_tpos_proj: linear(256, 64, vb.pp("obj_ptr_tpos_proj"))?,
         })
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn load_sam2_1_hiera_tiny(path: impl AsRef<Path>) -> Result<Self> {
@@ -137,7 +161,73 @@ impl Sam2Base {
         reverse: bool,
         num_frames: Option<usize>,
     ) -> Result<Sam2FrameOutput> {
+        self.track_with_mask_prompt(
+            image,
+            frame_index,
+            is_conditioning,
+            state,
+            points,
+            bounding_box,
+            None,
+            false,
+            multimask_output,
+            reverse,
+            num_frames,
+        )
+    }
+
+    /// Tracking variant used for correction clicks, where the previous
+    /// low-resolution mask logits are also supplied to the prompt encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_with_mask_prompt(
+        &self,
+        image: &Tensor,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        binarize_mask_for_memory: bool,
+        multimask_output: bool,
+        reverse: bool,
+        num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
         let backbone = self.image_encoder.forward(image)?;
+        self.track_backbone_with_mask_prompt(
+            &backbone,
+            frame_index,
+            is_conditioning,
+            state,
+            points,
+            bounding_box,
+            mask_input,
+            binarize_mask_for_memory,
+            multimask_output,
+            reverse,
+            num_frames,
+        )
+    }
+
+    pub fn encode_frame(&self, image: &Tensor) -> Result<BackboneOutput> {
+        self.image_encoder.forward(image)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_backbone_with_mask_prompt(
+        &self,
+        backbone: &BackboneOutput,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        binarize_mask_for_memory: bool,
+        multimask_output: bool,
+        reverse: bool,
+        num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
         let current = &backbone.vision_features;
         let current_pos = backbone.vision_pos_enc.last().unwrap();
         let (batch, channels, height, width) = current.dims4()?;
@@ -168,7 +258,7 @@ impl Sam2Base {
         let prompts = self.prompt_encoder.forward(
             point_coords.as_ref().zip(point_labels.as_ref()),
             box_tensor.as_ref(),
-            None,
+            mask_input,
         )?;
         let decoded = self.mask_decoder.forward(
             &conditioned,
@@ -178,13 +268,34 @@ impl Sam2Base {
             multimask_output,
             &backbone.backbone_fpn[..2],
         )?;
+        let (decoded_masks, decoded_token) = if multimask_output {
+            let best = decoded.iou_predictions.argmax_keepdim(1)?;
+            let (_, _, mask_height, mask_width) = decoded.masks.dims4()?;
+            let mask_indices = best
+                .reshape((batch, 1, 1, 1))?
+                .broadcast_as((batch, 1, mask_height, mask_width))?
+                .contiguous()?;
+            let token_indices = best
+                .reshape((batch, 1, 1))?
+                .broadcast_as((batch, 1, 256))?
+                .contiguous()?;
+            (
+                decoded.masks.contiguous()?.gather(&mask_indices, 1)?,
+                decoded
+                    .mask_tokens
+                    .contiguous()?
+                    .gather(&token_indices, 1)?,
+            )
+        } else {
+            (decoded.masks.clone(), decoded.mask_tokens.clone())
+        };
         let is_obj_appearing = decoded.object_score_logits.gt(0f32)?;
         let low_res_masks = is_obj_appearing
             .reshape((batch, 1, 1, 1))?
-            .broadcast_as(decoded.masks.dims())?
+            .broadcast_as(decoded_masks.dims())?
             .where_cond(
-                &decoded.masks,
-                &Tensor::full(-1024f32, decoded.masks.dims(), &self.device)?,
+                &decoded_masks,
+                &Tensor::full(-1024f32, decoded_masks.dims(), &self.device)?,
             )?;
         let high_res_masks = low_res_masks.upsample_bilinear2d(
             self.config.image_size,
@@ -193,10 +304,17 @@ impl Sam2Base {
         )?;
         // The memory encoder receives a scaled sigmoid probability, exactly as
         // specified by the SAM2.1 inference configs.
-        let memory_mask = sigmoid(&high_res_masks)?.affine(
-            self.config.sigmoid_scale_for_mem_enc,
-            self.config.sigmoid_bias_for_mem_enc,
-        )?;
+        let memory_mask = if binarize_mask_for_memory {
+            high_res_masks.gt(0f64)?.to_dtype(DType::F32)?.affine(
+                self.config.sigmoid_scale_for_mem_enc,
+                self.config.sigmoid_bias_for_mem_enc,
+            )?
+        } else {
+            sigmoid(&high_res_masks)?.affine(
+                self.config.sigmoid_scale_for_mem_enc,
+                self.config.sigmoid_bias_for_mem_enc,
+            )?
+        };
         let mut encoded = self
             .memory_encoder
             // SAM2 writes memories from the raw backbone feature, rather than
@@ -213,9 +331,7 @@ impl Sam2Base {
                     .broadcast_as(encoded.vision_features.dims())?,
             )?,
         )?;
-        let projected_pointer = self
-            .obj_ptr_proj
-            .forward(&decoded.mask_tokens.squeeze(1)?)?;
+        let projected_pointer = self.obj_ptr_proj.forward(&decoded_token.squeeze(1)?)?;
         let object_pointer = projected_pointer
             .broadcast_mul(&appearance.reshape((batch, 1))?)?
             .broadcast_add(
@@ -263,30 +379,34 @@ impl Sam2Base {
         num_frames: Option<usize>,
     ) -> Result<Sam2FrameOutput> {
         let backbone = self.image_encoder.forward(image)?;
+        self.track_mask_from_backbone(
+            &backbone,
+            mask,
+            frame_index,
+            is_conditioning,
+            state,
+            reverse,
+            num_frames,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_mask_from_backbone(
+        &self,
+        backbone: &BackboneOutput,
+        mask: &Tensor,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        _reverse: bool,
+        _num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
         let current = &backbone.vision_features;
-        let current_pos = backbone.vision_pos_enc.last().unwrap();
-        let (batch, channels, height, width) = current.dims4()?;
-        let conditioned = if is_conditioning {
-            current.broadcast_add(
-                &self
-                    .no_mem_embed
-                    .permute((1, 2, 0))?
-                    .reshape((1, 256, 1, 1))?,
-            )?
-        } else {
-            self.condition_with_memory(
-                current,
-                current_pos,
-                frame_index,
-                state,
-                reverse,
-                batch,
-                channels,
-                height,
-                width,
-                num_frames,
-            )?
-        };
+        let batch = current.dim(0)?;
+        // `use_mask_input_as_output_without_sam` bypasses temporal memory and
+        // the initial-frame no-memory embedding. The raw backbone feature is
+        // used only to derive the object pointer and spatial memory.
+        let conditioned = current.clone();
         let (mask_batch, mask_channels, mask_h, mask_w) = mask.dims4()?;
         if mask_batch != batch
             || mask_channels != 1
@@ -300,11 +420,14 @@ impl Sam2Base {
             )
         }
         let high_res_masks = mask.to_dtype(DType::F32)?.affine(20., -10.)?;
-        let low_res_masks = high_res_masks.upsample_bilinear2d(256, 256, false)?;
+        let low_res_masks = self.antialiased_bilinear_resize(&high_res_masks, 256, 256)?;
         let mask_prompt = self.mask_downsample.forward(&mask.to_dtype(DType::F32)?)?;
-        let prompts = self
-            .prompt_encoder
-            .forward(None, None, Some(&mask_prompt))?;
+        let (point_coords, point_labels, _) = self.prompt_tensors(&[], None)?;
+        let prompts = self.prompt_encoder.forward(
+            point_coords.as_ref().zip(point_labels.as_ref()),
+            None,
+            Some(&mask_prompt),
+        )?;
         let decoded = self.mask_decoder.forward(
             &conditioned,
             &self.prompt_encoder.get_dense_pe()?,
@@ -314,12 +437,26 @@ impl Sam2Base {
             &backbone.backbone_fpn[..2],
         )?;
         let appears = mask.max_all()?.to_scalar::<f32>()? > 0.;
-        let mut object_pointer = self
+        let projected_pointer = self
             .obj_ptr_proj
             .forward(&decoded.mask_tokens.squeeze(1)?)?;
-        if !appears {
-            object_pointer = self.no_obj_ptr.broadcast_as((batch, 256))?;
-        }
+        let decoder_appearance = decoded
+            .object_score_logits
+            .gt(0f64)?
+            .to_dtype(DType::F32)?
+            .reshape((batch, 1))?;
+        let decoder_pointer = projected_pointer
+            .broadcast_mul(&decoder_appearance)?
+            .broadcast_add(
+                &decoder_appearance
+                    .affine(-1., 1.)?
+                    .broadcast_mul(&self.no_obj_ptr.broadcast_as((batch, 256))?)?,
+            )?;
+        let object_pointer = if appears {
+            decoder_pointer
+        } else {
+            self.no_obj_ptr.broadcast_as((batch, 256))?
+        };
         let memory_mask = sigmoid(&high_res_masks)?.affine(
             self.config.sigmoid_scale_for_mem_enc,
             self.config.sigmoid_bias_for_mem_enc,
@@ -360,6 +497,94 @@ impl Sam2Base {
         })
     }
 
+    /// Rebuilds temporal memory from finalized low-resolution mask logits.
+    /// Interactive video uses this during preflight after hole filling and
+    /// optional multi-object constraints have been applied.
+    pub fn reencode_memory(
+        &self,
+        image: &Tensor,
+        low_res_masks: &Tensor,
+        object_score_logits: &Tensor,
+        object_pointer: &Tensor,
+        binarize_mask_from_points: bool,
+    ) -> Result<MemoryFrame> {
+        let backbone = self.image_encoder.forward(image)?;
+        self.reencode_memory_from_backbone(
+            &backbone,
+            low_res_masks,
+            object_score_logits,
+            object_pointer,
+            binarize_mask_from_points,
+        )
+    }
+
+    pub fn reencode_memory_from_backbone(
+        &self,
+        backbone: &BackboneOutput,
+        low_res_masks: &Tensor,
+        object_score_logits: &Tensor,
+        object_pointer: &Tensor,
+        binarize_mask_from_points: bool,
+    ) -> Result<MemoryFrame> {
+        let high_res_masks = low_res_masks.to_dtype(DType::F32)?.upsample_bilinear2d(
+            self.config.image_size,
+            self.config.image_size,
+            false,
+        )?;
+        self.reencode_memory_from_high_res(
+            backbone,
+            &high_res_masks,
+            low_res_masks,
+            object_score_logits,
+            object_pointer,
+            binarize_mask_from_points,
+        )
+    }
+
+    pub fn reencode_memory_from_high_res(
+        &self,
+        backbone: &BackboneOutput,
+        high_res_masks: &Tensor,
+        low_res_masks: &Tensor,
+        object_score_logits: &Tensor,
+        object_pointer: &Tensor,
+        binarize_mask_from_points: bool,
+    ) -> Result<MemoryFrame> {
+        let memory_mask = if binarize_mask_from_points {
+            high_res_masks.gt(0f64)?.to_dtype(DType::F32)?.affine(
+                self.config.sigmoid_scale_for_mem_enc,
+                self.config.sigmoid_bias_for_mem_enc,
+            )?
+        } else {
+            sigmoid(&high_res_masks)?.affine(
+                self.config.sigmoid_scale_for_mem_enc,
+                self.config.sigmoid_bias_for_mem_enc,
+            )?
+        };
+        let mut encoded =
+            self.memory_encoder
+                .forward(&backbone.vision_features, &memory_mask, true)?;
+        let batch = low_res_masks.dim(0)?;
+        let appearance = object_score_logits
+            .gt(0f64)?
+            .to_dtype(DType::F32)?
+            .reshape((batch, 1, 1, 1))?;
+        encoded.vision_features = encoded.vision_features.broadcast_add(
+            &appearance.affine(-1., 1.)?.broadcast_mul(
+                &self
+                    .no_obj_embed_spatial
+                    .reshape((1, 64, 1, 1))?
+                    .broadcast_as(encoded.vision_features.dims())?,
+            )?,
+        )?;
+        Ok(MemoryFrame {
+            memory_features: encoded.vision_features,
+            memory_pos_enc: encoded.vision_pos_enc,
+            object_pointer: object_pointer.clone(),
+            low_res_mask_logits: low_res_masks.clone(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn condition_with_memory(
         &self,
@@ -381,7 +606,7 @@ impl Sam2Base {
             .maskmem_tpos_enc
             .narrow(0, self.config.num_maskmem - 1, 1)?
             .squeeze(0)?;
-        for (_, frame) in selected {
+        for (_, frame) in &selected {
             Self::push_spatial_memory(
                 &mut memories,
                 &mut positions,
@@ -425,10 +650,35 @@ impl Sam2Base {
             .min(16)
             .saturating_sub(1)
             .max(1) as f32;
-        for (index, frame) in state
-            .temporal_candidates(frame_index, usize::MAX, 15, reverse)
+        // SAM2.1's eval configuration restricts object pointers (but not
+        // spatial mask memories) to frames already visited in the tracking
+        // direction. Conditioning pointers come first.
+        let mut pointer_frames = selected
             .into_iter()
-        {
+            .filter(|(index, _)| {
+                if reverse {
+                    *index >= frame_index
+                } else {
+                    *index <= frame_index
+                }
+            })
+            .collect::<Vec<_>>();
+        let max_obj_ptrs = num_frames.unwrap_or(16).min(16);
+        for difference in 1..max_obj_ptrs {
+            let index = if reverse {
+                frame_index.checked_add(difference)
+            } else {
+                frame_index.checked_sub(difference)
+            };
+            let Some(index) = index else { break };
+            if num_frames.is_some_and(|frames| index >= frames) {
+                break;
+            }
+            if let Some(frame) = state.propagated().get(&index) {
+                pointer_frames.push((index, frame));
+            }
+        }
+        for (index, frame) in pointer_frames {
             let delta = if reverse {
                 index as f32 - frame_index as f32
             } else {
@@ -507,13 +757,65 @@ impl Sam2Base {
             .broadcast_as((1, batch, 64))
     }
 
+    pub fn antialiased_bilinear_resize(
+        &self,
+        input: &Tensor,
+        output_height: usize,
+        output_width: usize,
+    ) -> Result<Tensor> {
+        let (batch, channels, input_height, input_width) = input.dims4()?;
+        fn weights(input: usize, output: usize, device: &Device) -> Result<Tensor> {
+            let scale = output as f32 / input as f32;
+            let filter_scale = scale.min(1.);
+            let support = 1. / filter_scale;
+            let mut values = vec![0f32; output * input];
+            for out in 0..output {
+                let center = (out as f32 + 0.5) / scale - 0.5;
+                let start = (center - support).ceil() as isize;
+                let end = (center + support).floor() as isize;
+                let mut sum = 0f32;
+                for index in start..=end {
+                    if index >= 0 && (index as usize) < input {
+                        let value = (1. - ((index as f32 - center) * filter_scale).abs()).max(0.);
+                        values[out * input + index as usize] = value;
+                        sum += value;
+                    }
+                }
+                for index in 0..input {
+                    values[out * input + index] /= sum;
+                }
+            }
+            Tensor::from_vec(values, (output, input), device)
+        }
+        let height_weights = weights(input_height, output_height, input.device())?;
+        let width_weights = weights(input_width, output_width, input.device())?;
+        let height = input
+            .permute((0, 1, 3, 2))?
+            .reshape((batch * channels * input_width, input_height))?
+            .matmul(&height_weights.t()?)?
+            .reshape((batch, channels, input_width, output_height))?
+            .permute((0, 1, 3, 2))?;
+        height
+            .reshape((batch * channels * output_height, input_width))?
+            .matmul(&width_weights.t()?)?
+            .reshape((batch, channels, output_height, output_width))
+    }
+
     fn prompt_tensors(
         &self,
         points: &[PointPrompt],
         bounding_box: Option<BoxPrompt>,
     ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-        let point_coords = (!points.is_empty())
+        // The video model does not pass `None` when a frame has no clicks.
+        // It supplies one label -1 point, after which PromptEncoder adds its
+        // usual padding point. Those two sparse no-point tokens are observable
+        // by the mask decoder and cannot be replaced by an empty sequence.
+        let use_no_point = points.is_empty() && bounding_box.is_none();
+        let point_coords = (!points.is_empty() || use_no_point)
             .then(|| {
+                if use_no_point {
+                    return Tensor::zeros((1, 1, 2), DType::F32, &self.device);
+                }
                 Tensor::from_vec(
                     points.iter().flat_map(|p| [p.x, p.y]).collect::<Vec<_>>(),
                     (1, points.len(), 2),
@@ -521,8 +823,11 @@ impl Sam2Base {
                 )
             })
             .transpose()?;
-        let point_labels = (!points.is_empty())
+        let point_labels = (!points.is_empty() || use_no_point)
             .then(|| {
+                if use_no_point {
+                    return Tensor::full(-1i64, (1, 1), &self.device);
+                }
                 Tensor::from_vec(
                     points
                         .iter()

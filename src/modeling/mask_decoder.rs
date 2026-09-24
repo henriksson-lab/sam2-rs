@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 use candle_nn::{
     Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, VarBuilder, conv_transpose2d,
     conv2d,
@@ -21,6 +21,37 @@ pub struct MaskDecoderOutput {
     pub object_score_logits: Tensor,
     pub upscaled_embedding: Tensor,
     pub hyper_in: Tensor,
+}
+
+/// Inference-time mask selection options normally supplied by the Python
+/// builder's `apply_postprocessing` overrides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaskDecoderConfig {
+    pub dynamic_multimask_via_stability: bool,
+    pub dynamic_multimask_stability_delta: f64,
+    pub dynamic_multimask_stability_threshold: f64,
+}
+
+impl MaskDecoderConfig {
+    /// Deterministic token-zero selection used by low-level parity and
+    /// component probes that disable Python builder postprocessing.
+    pub const fn raw() -> Self {
+        Self {
+            dynamic_multimask_via_stability: false,
+            dynamic_multimask_stability_delta: 0.05,
+            dynamic_multimask_stability_threshold: 0.98,
+        }
+    }
+}
+
+impl Default for MaskDecoderConfig {
+    /// Matches `build_sam2(..., apply_postprocessing=True)`.
+    fn default() -> Self {
+        Self {
+            dynamic_multimask_via_stability: true,
+            ..Self::raw()
+        }
+    }
 }
 
 /// Stable component boundaries for locating CPU decoder regressions.  This is
@@ -59,6 +90,9 @@ pub struct MaskDecoder {
     hypernetworks: [Mlp; 4],
     iou_head: Mlp,
     object_score_head: Mlp,
+    dynamic_multimask_via_stability: bool,
+    dynamic_multimask_stability_delta: f64,
+    dynamic_multimask_stability_thresh: f64,
 }
 
 impl MaskDecoder {
@@ -72,6 +106,10 @@ impl MaskDecoder {
     }
 
     pub fn load(vb: VarBuilder) -> Result<Self> {
+        Self::load_with_config(vb, MaskDecoderConfig::raw())
+    }
+
+    pub fn load_with_config(vb: VarBuilder, config: MaskDecoderConfig) -> Result<Self> {
         Ok(Self {
             transformer: TwoWayTransformer::load(vb.pp("transformer"))?,
             iou_token: vb.get((1, 256), "iou_token.weight")?,
@@ -156,7 +194,87 @@ impl MaskDecoder {
                 false,
                 vb.pp("pred_obj_score_head"),
             )?,
+            dynamic_multimask_via_stability: config.dynamic_multimask_via_stability,
+            dynamic_multimask_stability_delta: config.dynamic_multimask_stability_delta,
+            dynamic_multimask_stability_thresh: config.dynamic_multimask_stability_threshold,
         })
+    }
+
+    /// Computes the IoU between masks thresholded at `delta` and `-delta`.
+    /// Empty unions have stability one, matching the reference implementation.
+    pub fn stability_scores(mask_logits: &Tensor, delta: f64) -> Result<Tensor> {
+        let rank = mask_logits.rank();
+        if rank < 2 {
+            candle_core::bail!("mask logits must have at least two spatial dimensions")
+        }
+        let height = mask_logits.dim(rank - 2)?;
+        let width = mask_logits.dim(rank - 1)?;
+        let flattened = mask_logits.flatten_from(rank - 2)?;
+        debug_assert_eq!(flattened.dim(rank - 2)?, height * width);
+        let area_i = flattened.gt(delta)?.to_dtype(DType::F32)?.sum(rank - 2)?;
+        let area_u = flattened.gt(-delta)?.to_dtype(DType::F32)?.sum(rank - 2)?;
+        let nonempty = area_u.gt(0f64)?;
+        let ratio = area_i.broadcast_div(&area_u.maximum(1f64)?)?;
+        nonempty.where_cond(&ratio, &ratio.ones_like()?)
+    }
+
+    /// Selects token zero when stable and otherwise the highest-IoU mask from
+    /// tokens one through three.
+    pub fn dynamic_multimask_via_stability(
+        all_mask_logits: &Tensor,
+        all_iou_scores: &Tensor,
+        stability_delta: f64,
+        stability_threshold: f64,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, tokens, height, width) = all_mask_logits.dims4()?;
+        if tokens < 2 || all_iou_scores.dims() != [batch, tokens] {
+            candle_core::bail!(
+                "dynamic multimask expects matching BxTxHxW logits and BxT IoU scores"
+            )
+        }
+        let multimask_logits = all_mask_logits.narrow(1, 1, tokens - 1)?;
+        let multimask_iou_scores = all_iou_scores.narrow(1, 1, tokens - 1)?;
+        let best_indices = multimask_iou_scores.argmax_keepdim(1)?;
+        let best_iou_scores = multimask_iou_scores
+            .contiguous()?
+            .gather(&best_indices, 1)?;
+        let mask_indices = best_indices
+            .reshape((batch, 1, 1, 1))?
+            .broadcast_as((batch, 1, height, width))?
+            .contiguous()?;
+        let best_mask_logits = multimask_logits.contiguous()?.gather(&mask_indices, 1)?;
+
+        let singlemask_logits = all_mask_logits.narrow(1, 0, 1)?;
+        let singlemask_iou_scores = all_iou_scores.narrow(1, 0, 1)?;
+        let stable =
+            Self::stability_scores(&singlemask_logits, stability_delta)?.ge(stability_threshold)?;
+        let mask_stable = stable
+            .unsqueeze(2)?
+            .unsqueeze(3)?
+            .broadcast_as(singlemask_logits.shape())?;
+        let mask_logits = mask_stable.where_cond(&singlemask_logits, &best_mask_logits)?;
+        let iou_scores = stable.where_cond(&singlemask_iou_scores, &best_iou_scores)?;
+        Ok((mask_logits, iou_scores))
+    }
+
+    fn select_masks(
+        &self,
+        masks: &Tensor,
+        iou_predictions: &Tensor,
+        multimask_output: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        if multimask_output {
+            Ok((masks.narrow(1, 1, 3)?, iou_predictions.narrow(1, 1, 3)?))
+        } else if self.dynamic_multimask_via_stability {
+            Self::dynamic_multimask_via_stability(
+                masks,
+                iou_predictions,
+                self.dynamic_multimask_stability_delta,
+                self.dynamic_multimask_stability_thresh,
+            )
+        } else {
+            Ok((masks.narrow(1, 0, 1)?, iou_predictions.narrow(1, 0, 1)?))
+        }
     }
 
     /// Static-image decoder. `high_res_features` is [256x256, 128x128], the
@@ -239,8 +357,8 @@ impl MaskDecoder {
         let object_score_logits = self
             .object_score_head
             .forward(&hs.narrow(1, 0, 1)?.squeeze(1)?)?;
-        let (b, c, h, w) = image_embeddings.dims4()?;
-        let src = src.permute((0, 2, 1))?.reshape((b, c, h, w))?;
+        let (_, c, h, w) = image_embeddings.dims4()?;
+        let src = src.permute((0, 2, 1))?.reshape((batch, c, h, w))?;
         let skip = if preprojected {
             high_res_features[1].clone()
         } else {
@@ -265,18 +383,19 @@ impl MaskDecoder {
         let hyper = Tensor::stack(&hyper_refs, 1)?;
         let (_, channels, up_h, up_w) = x.dims4()?;
         let masks = hyper
-            .matmul(&x.contiguous()?.reshape((b, channels, up_h * up_w))?)?
-            .reshape((b, 4usize, up_h, up_w))?;
+            .matmul(&x.contiguous()?.reshape((batch, channels, up_h * up_w))?)?
+            .reshape((batch, 4usize, up_h, up_w))?;
         let iou_predictions = self.iou_head.forward(&iou_token_out)?;
-        let (masks, iou_predictions) = if multimask_output {
-            (masks.narrow(1, 1, 3)?, iou_predictions.narrow(1, 1, 3)?)
-        } else {
-            (masks.narrow(1, 0, 1)?, iou_predictions.narrow(1, 0, 1)?)
-        };
+        let (masks, iou_predictions) =
+            self.select_masks(&masks, &iou_predictions, multimask_output)?;
         Ok(MaskDecoderOutput {
             masks,
             iou_predictions,
-            mask_tokens: mask_tokens.narrow(1, 0, 1)?,
+            mask_tokens: if multimask_output {
+                mask_tokens.narrow(1, 1, 3)?
+            } else {
+                mask_tokens.narrow(1, 0, 1)?
+            },
             object_score_logits,
             upscaled_embedding: x,
             hyper_in: hyper,
@@ -360,8 +479,8 @@ impl MaskDecoder {
         profile.transformer = transformer_profile;
         let iou_token_out = hs.narrow(1, 1, 1)?.squeeze(1)?;
         let mask_tokens = hs.narrow(1, 2, 4)?;
-        let (b, c, h, w) = image_embeddings.dims4()?;
-        let src = src.permute((0, 2, 1))?.reshape((b, c, h, w))?;
+        let (_, c, h, w) = image_embeddings.dims4()?;
+        let src = src.permute((0, 2, 1))?.reshape((batch, c, h, w))?;
 
         let start = Instant::now();
         let skip = if preprojected {
@@ -403,30 +522,89 @@ impl MaskDecoder {
         let start = Instant::now();
         let (_, channels, up_h, up_w) = x.dims4()?;
         let masks = hyper
-            .matmul(&x.contiguous()?.reshape((b, channels, up_h * up_w))?)?
-            .reshape((b, 4usize, up_h, up_w))?;
+            .matmul(&x.contiguous()?.reshape((batch, channels, up_h * up_w))?)?
+            .reshape((batch, 4usize, up_h, up_w))?;
         profile.mask_projection_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
         let object_score_logits = self
             .object_score_head
             .forward(&hs.narrow(1, 0, 1)?.squeeze(1)?)?;
         let iou_predictions = self.iou_head.forward(&iou_token_out)?;
-        let (masks, iou_predictions) = if multimask_output {
-            (masks.narrow(1, 1, 3)?, iou_predictions.narrow(1, 1, 3)?)
-        } else {
-            (masks.narrow(1, 0, 1)?, iou_predictions.narrow(1, 0, 1)?)
-        };
+        let (masks, iou_predictions) =
+            self.select_masks(&masks, &iou_predictions, multimask_output)?;
         profile.heads_ms = start.elapsed().as_secs_f64() * 1000.;
         Ok((
             MaskDecoderOutput {
                 masks,
                 iou_predictions,
-                mask_tokens: mask_tokens.narrow(1, 0, 1)?,
+                mask_tokens: if multimask_output {
+                    mask_tokens.narrow(1, 1, 3)?
+                } else {
+                    mask_tokens.narrow(1, 0, 1)?
+                },
                 object_score_logits,
                 upscaled_embedding: x,
                 hyper_in: hyper,
             },
             profile,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::Device;
+
+    use super::*;
+
+    #[test]
+    fn stability_scores_treat_empty_masks_as_stable() {
+        let logits = Tensor::from_vec(
+            vec![1f32, 1., 1., 1., -1., -1., -1., -1.],
+            (2, 1, 2, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(
+            MaskDecoder::stability_scores(&logits, 0.05)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![1.], vec![1.]]
+        );
+    }
+
+    #[test]
+    fn unstable_single_mask_falls_back_to_highest_iou_multimask() {
+        let mut values = Vec::new();
+        values.extend([1f32; 4]);
+        values.extend([11f32; 4]);
+        values.extend([12f32; 4]);
+        values.extend([13f32; 4]);
+        values.extend([0f32, 0., 1., -1.]);
+        values.extend([21f32; 4]);
+        values.extend([22f32; 4]);
+        values.extend([23f32; 4]);
+        let logits = Tensor::from_vec(values, (2, 4, 2, 2), &Device::Cpu).unwrap();
+        let ious = Tensor::from_vec(
+            vec![0.7f32, 0.8, 0.6, 0.5, 0.1, 0.2, 0.9, 0.5],
+            (2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let (selected_logits, selected_ious) =
+            MaskDecoder::dynamic_multimask_via_stability(&logits, &ious, 0.05, 0.98).unwrap();
+        assert_eq!(
+            selected_logits
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1., 1., 1., 1., 22., 22., 22., 22.]
+        );
+        assert_eq!(
+            selected_ious.to_vec2::<f32>().unwrap(),
+            vec![vec![0.7], vec![0.9]]
+        );
     }
 }

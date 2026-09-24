@@ -2,6 +2,8 @@
 
 use candle_core::{DType, Device, Result, Tensor, bail};
 
+use crate::ops::connected_components_8;
+
 /// Metadata retained to transform prompts and masks between original pixels and
 /// SAM2's fixed square input coordinate system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,17 +37,56 @@ pub struct PreparedImage {
 #[derive(Clone, Copy, Debug)]
 pub struct Sam2ImageTransforms {
     resolution: usize,
+    mask_threshold: f64,
+    max_hole_area: usize,
+    max_sprinkle_area: usize,
 }
 
 impl Default for Sam2ImageTransforms {
     fn default() -> Self {
-        Self { resolution: 1024 }
+        Self {
+            resolution: 1024,
+            mask_threshold: 0.,
+            max_hole_area: 0,
+            max_sprinkle_area: 0,
+        }
     }
 }
 
 impl Sam2ImageTransforms {
     pub const fn new(resolution: usize) -> Self {
-        Self { resolution }
+        Self {
+            resolution,
+            mask_threshold: 0.,
+            max_hole_area: 0,
+            max_sprinkle_area: 0,
+        }
+    }
+
+    pub const fn with_postprocessing(
+        resolution: usize,
+        mask_threshold: f64,
+        max_hole_area: usize,
+        max_sprinkle_area: usize,
+    ) -> Self {
+        Self {
+            resolution,
+            mask_threshold,
+            max_hole_area,
+            max_sprinkle_area,
+        }
+    }
+
+    pub const fn mask_threshold(&self) -> f64 {
+        self.mask_threshold
+    }
+
+    pub const fn max_hole_area(&self) -> usize {
+        self.max_hole_area
+    }
+
+    pub const fn max_sprinkle_area(&self) -> usize {
+        self.max_sprinkle_area
     }
 
     pub fn prepare_rgb8(
@@ -93,6 +134,79 @@ impl Sam2ImageTransforms {
         })
     }
 
+    /// Batched equivalent of upstream `forward_batch`. Every image is resized
+    /// independently and the retained geometries map prompts back to its
+    /// original dimensions.
+    pub fn forward_batch(
+        &self,
+        images: &[(&[u8], usize, usize)],
+        device: &Device,
+    ) -> Result<(Tensor, Vec<ImageGeometry>)> {
+        if images.is_empty() {
+            bail!("image batch must not be empty")
+        }
+        let prepared = images
+            .iter()
+            .map(|&(pixels, width, height)| self.prepare_rgb8(pixels, width, height, device))
+            .collect::<Result<Vec<_>>>()?;
+        let tensors = prepared
+            .iter()
+            .map(|image| &image.tensor)
+            .collect::<Vec<_>>();
+        let tensor = Tensor::cat(&tensors, 0)?;
+        let geometries = prepared.into_iter().map(|image| image.geometry).collect();
+        Ok((tensor, geometries))
+    }
+
+    pub fn transform_coords(
+        &self,
+        coordinates: &Tensor,
+        normalize: bool,
+        original_height_width: Option<(usize, usize)>,
+    ) -> Result<Tensor> {
+        if coordinates.dim(coordinates.rank().saturating_sub(1))? != 2 {
+            bail!("coordinates must have length two in the last dimension")
+        }
+        let coordinates = coordinates.to_dtype(DType::F32)?;
+        let scale = if normalize {
+            let (height, width) = original_height_width.ok_or_else(|| {
+                candle_core::Error::Msg("normalized coordinates need orig_hw".into())
+            })?;
+            Tensor::new(
+                &[
+                    self.resolution as f32 / width as f32,
+                    self.resolution as f32 / height as f32,
+                ],
+                coordinates.device(),
+            )?
+        } else {
+            Tensor::new(
+                &[self.resolution as f32, self.resolution as f32],
+                coordinates.device(),
+            )?
+        };
+        coordinates.broadcast_mul(&scale)
+    }
+
+    pub fn transform_boxes(
+        &self,
+        boxes: &Tensor,
+        normalize: bool,
+        original_height_width: Option<(usize, usize)>,
+    ) -> Result<Tensor> {
+        if boxes.dim(boxes.rank().saturating_sub(1))? != 4 {
+            bail!("boxes must have length four in the last dimension")
+        }
+        let mut shape = boxes.dims().to_vec();
+        shape.pop();
+        shape.extend([2, 2]);
+        self.transform_coords(
+            &boxes.reshape(candle_core::Shape::from_dims(&shape))?,
+            normalize,
+            original_height_width,
+        )
+    }
+
     /// Restores N×M×h×w logits to the original image size. This deliberately
     /// keeps logits rather than thresholding, matching Python's `return_logits`.
     pub fn restore_masks(&self, low_res_masks: &Tensor, geometry: ImageGeometry) -> Result<Tensor> {
@@ -101,6 +215,53 @@ impl Sam2ImageTransforms {
             geometry.original_width,
             false,
         )
+    }
+
+    /// Applies reference hole/sprinkle cleanup at the native mask resolution,
+    /// then restores logits to `(original_height, original_width)`.
+    pub fn postprocess_masks(
+        &self,
+        masks: &Tensor,
+        original_height: usize,
+        original_width: usize,
+    ) -> Result<Tensor> {
+        let masks = masks.to_dtype(DType::F32)?;
+        let (batch, channels, height, width) = masks.dims4()?;
+        let flat = masks.reshape((batch * channels, 1, height, width))?;
+        let mut output = masks.clone();
+        if self.max_hole_area > 0 {
+            let (labels, areas) = connected_components_8(&flat.le(self.mask_threshold)?)?;
+            let region = labels
+                .gt(0f64)?
+                .to_dtype(DType::U32)?
+                .mul(&areas.le(self.max_hole_area as f64)?.to_dtype(DType::U32)?)?
+                .ne(0f64)?
+                .reshape(masks.shape())?;
+            output = region.where_cond(
+                &output.ones_like()?.affine(0., self.mask_threshold + 10.)?,
+                &output,
+            )?;
+        }
+        if self.max_sprinkle_area > 0 {
+            // Reference intentionally computes both component maps from the
+            // original masks, not from the hole-filled intermediate output.
+            let (labels, areas) = connected_components_8(&flat.gt(self.mask_threshold)?)?;
+            let region = labels
+                .gt(0f64)?
+                .to_dtype(DType::U32)?
+                .mul(
+                    &areas
+                        .le(self.max_sprinkle_area as f64)?
+                        .to_dtype(DType::U32)?,
+                )?
+                .ne(0f64)?
+                .reshape(masks.shape())?;
+            output = region.where_cond(
+                &output.ones_like()?.affine(0., self.mask_threshold - 10.)?,
+                &output,
+            )?;
+        }
+        output.upsample_bilinear2d(original_height, original_width, false)
     }
 }
 

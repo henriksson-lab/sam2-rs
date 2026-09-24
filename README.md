@@ -1,6 +1,66 @@
 # sam2-rs
 
-Native Candle-backed SAM2.1 inference with static, video/z-slice, automatic-mask, and checkpoint-conversion APIs.
+Native Candle-backed SAM2.1 inference with static, video/z-slice,
+automatic-mask, and direct PyTorch/safetensors checkpoint-loading APIs.
+
+Translation coverage and the bottom-up remaining-feature checklist are tracked
+in [TRANSLATION.md](TRANSLATION.md). The original architecture handover remains
+in [handover.md](handover.md).
+
+## Inference APIs
+
+Published `.pt` checkpoints load directly; the same APIs also accept converted
+`.safetensors` files. Cached image prediction reuses the image encoder:
+
+```rust,no_run
+use sam2_rs::{ImagePromptBatch, Sam2ImagePredictor, Sam2Variant};
+
+let mut predictor = Sam2ImagePredictor::load_sam2_1(
+    Sam2Variant::HieraTiny,
+    "checkpoints/sam2.1_hiera_tiny.pt",
+)?;
+predictor.set_image(&rgb_bytes, width, height)?;
+let prediction = predictor.predict_cached(
+    &ImagePromptBatch::default(),
+    false,
+    false,
+)?;
+```
+
+Automatic masks and editable multi-object video use typed configurations:
+
+```rust,no_run
+use sam2_rs::{
+    AutomaticMaskConfig, PointPrompt, Sam2AutomaticMaskGenerator,
+    Sam2InteractiveVideoPredictor, Sam2Variant, VideoPredictorConfig,
+};
+
+let generator = Sam2AutomaticMaskGenerator::load_sam2_1(
+    Sam2Variant::HieraTiny,
+    "checkpoints/sam2.1_hiera_tiny.pt",
+    AutomaticMaskConfig::default(),
+)?;
+let masks = generator.generate_rgb8(&rgb_bytes, width, height)?;
+
+let video = Sam2InteractiveVideoPredictor::load_sam2_1(
+    Sam2Variant::HieraTiny,
+    "checkpoints/sam2.1_hiera_tiny.pt",
+    VideoPredictorConfig::default(),
+)?;
+let mut session = video.init_state(&frames)?;
+video.add_new_points(
+    &mut session,
+    0,
+    101,
+    &[PointPrompt { x: 120.0, y: 80.0, positive: true }],
+    true,
+)?;
+let tracked = video.propagate_in_video(&mut session, None, None, false)?;
+```
+
+Here `rgb_bytes` is interleaved RGB8 and `frames` is a slice of
+`(&[u8], width, height)` tuples. See [PARITY.md](PARITY.md) for reproducible
+Python/Rust conformance commands.
 
 ## Reproducible performance baseline
 

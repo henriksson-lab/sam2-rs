@@ -11,7 +11,7 @@ pub mod two_way_transformer;
 
 pub use fpn_neck::{BackboneOutput, FpnNeck, ImageEncoder, ImageEncoderProfile};
 pub use hiera::{Hiera, HieraProfile};
-pub use mask_decoder::{MaskDecoder, MaskDecoderOutput, MaskDecoderProfile};
+pub use mask_decoder::{MaskDecoder, MaskDecoderConfig, MaskDecoderOutput, MaskDecoderProfile};
 pub use memory_attention::MemoryAttention;
 pub use memory_encoder::{MemoryEncoder, MemoryEncoderOutput};
 pub use prompt_encoder::{PromptEncoder, PromptEncoderOutput};

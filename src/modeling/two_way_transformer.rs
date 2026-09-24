@@ -240,9 +240,15 @@ impl Attention {
             return Ok(output);
         }
         let phase_start = profile.is_some().then(Instant::now);
-        let q = self.separate_heads(&self.q_proj.forward_fused_bias_cpu(q)?)?;
-        let k = self.separate_heads(&self.k_proj.forward_fused_bias_cpu(k)?)?;
-        let v = self.separate_heads(&self.v_proj.forward_fused_bias_cpu(v)?)?;
+        let q = self
+            .separate_heads(&self.q_proj.forward_fused_bias_cpu(q)?)?
+            .contiguous()?;
+        let k = self
+            .separate_heads(&self.k_proj.forward_fused_bias_cpu(k)?)?
+            .contiguous()?;
+        let v = self
+            .separate_heads(&self.v_proj.forward_fused_bias_cpu(v)?)?
+            .contiguous()?;
         if let (Some(profile), Some(start)) = (profile.as_deref_mut(), phase_start) {
             profile.qkv_ms = start.elapsed().as_secs_f64() * 1000.;
         }
@@ -252,7 +258,7 @@ impl Attention {
             &q.matmul(&k.transpose(2, 3)?.contiguous()?)?
                 .affine(1. / (dim as f64).sqrt(), 0.)?,
         )?;
-        let attended = self.recombine_heads(&attention.matmul(&v)?)?;
+        let attended = self.recombine_heads(&attention.contiguous()?.matmul(&v)?)?;
         if let (Some(profile), Some(start)) = (profile.as_deref_mut(), phase_start) {
             profile.kernel_ms = start.elapsed().as_secs_f64() * 1000.;
         }
@@ -354,7 +360,7 @@ impl RopeAttention {
             self.rope_theta,
             q.device(),
         )?;
-        let q = apply_rotary(&q, &cos, &sin)?;
+        let q = apply_rotary(&q, &cos, &sin)?.contiguous()?;
         let repeats = rope_keys / q_tokens;
         if repeats != 1 && !self.rope_k_repeat {
             bail!("RoPE cross-attention received repeated memory keys without rope_k_repeat")
@@ -366,14 +372,16 @@ impl RopeAttention {
             rotated
         } else {
             Tensor::cat(&[&rotated, &k.narrow(2, rope_keys, num_k_exclude_rope)?], 2)?
-        };
+        }
+        .contiguous()?;
         let dim = self.internal_dim / self.num_heads;
         let attention = softmax_last_dim(
             &q.matmul(&k.transpose(2, 3)?.contiguous()?)?
                 .affine(1. / (dim as f64).sqrt(), 0.)?,
         )?;
-        self.out_proj
-            .forward_fused_bias_cpu(&self.recombine_heads(&attention.matmul(&v)?)?)
+        self.out_proj.forward_fused_bias_cpu(
+            &self.recombine_heads(&attention.contiguous()?.matmul(&v.contiguous()?)?)?,
+        )
     }
 
     fn separate_heads(&self, x: &Tensor) -> Result<Tensor> {

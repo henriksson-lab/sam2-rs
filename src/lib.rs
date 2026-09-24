@@ -19,14 +19,19 @@ pub use config::{HieraConfig, Sam2Config, Sam2Variant};
 pub use error::{Error, Result};
 pub use modeling::{
     Attention, BackboneOutput, FpnNeck, Hiera, HieraProfile, ImageEncoder, ImageEncoderProfile,
-    MaskDecoder, MaskDecoderOutput, MaskDecoderProfile, MemoryAttention, MemoryEncoder,
-    MemoryEncoderOutput, PromptEncoder, PromptEncoderOutput, RopeAttention, Sam2Base,
-    Sam2FrameOutput, TwoWayTransformer, TwoWayTransformerProfile,
+    MaskDecoder, MaskDecoderConfig, MaskDecoderOutput, MaskDecoderProfile, MemoryAttention,
+    MemoryEncoder, MemoryEncoderOutput, PromptEncoder, PromptEncoderOutput, RopeAttention,
+    Sam2Base, Sam2FrameOutput, TwoWayTransformer, TwoWayTransformerProfile,
 };
+pub use ops::MaskRle;
 pub use predictor::{
-    AutomaticMask, AutomaticMaskConfig, BoxPrompt, ImagePrediction, MaskRle, PointPrompt,
-    Sam2AutomaticMaskGenerator, Sam2ImagePredictor, Sam2MultiObjectVideoPredictor,
-    Sam2VideoPredictor, VideoFramePrediction,
+    AutomaticMask, AutomaticMaskConfig, AutomaticMaskOutputMode, AutomaticMaskSegmentation,
+    BoxPrompt, ImagePrediction, ImagePredictorConfig, ImagePromptBatch, InteractiveVideoOutput,
+    InteractiveVideoSession, PointPrompt, RemoveObjectOutput, Sam2AutomaticMaskGenerator,
+    Sam2ImagePredictor, Sam2InteractiveVideoPredictor, Sam2MultiObjectVideoPredictor,
+    Sam2VideoPredictor, VideoFramePrediction, VideoPredictorConfig,
 };
 pub use transforms::{ImageGeometry, PreparedImage, Sam2ImageTransforms};
-pub use video_state::{MemoryFrame, VideoInferenceState};
+pub use video_state::{
+    MemoryFrame, ObjectInferenceState, TrackedFrame, VideoInferenceState, VideoPromptInput,
+};
