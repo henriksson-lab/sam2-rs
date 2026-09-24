@@ -73,6 +73,22 @@ fn main() -> ExitCode {
             "cuda" => Device::new_cuda(0)?,
             _ => candle_core::bail!("unsupported device {device_name:?}; expected cpu or cuda"),
         };
+        #[cfg(feature = "cuda")]
+        if device_name == "cuda"
+            && !decoder_only
+            && !profile_stages
+            && !profile_encoder
+            && !profile_decoder
+            && std::env::var_os("SAM2_CUDA_GRAPH").is_some_and(|value| value == "1")
+        {
+            let Device::Cuda(cuda) = &device else {
+                unreachable!()
+            };
+            // SAFETY: Static graph benchmarking uses only Candle's one device
+            // stream and synchronizes every replay. Cross-stream lifetime
+            // events therefore provide no ordering that this path needs.
+            unsafe { cuda.disable_event_tracking() };
+        }
         let predictor =
             Sam2ImagePredictor::load_sam2_1_on_device(Sam2Variant::HieraTiny, &args[0], &device)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&args[1]], DType::F32, &device) }?;
@@ -90,6 +106,44 @@ fn main() -> ExitCode {
             None
         };
         device.synchronize()?;
+        #[cfg(feature = "cuda")]
+        let graph_state = if device_name == "cuda"
+            && !decoder_only
+            && !profile_stages
+            && !profile_encoder
+            && !profile_decoder
+            && std::env::var_os("SAM2_CUDA_GRAPH").is_some_and(|value| value == "1")
+        {
+            use candle_core::cuda_backend::cudarc::driver::sys::{
+                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED,
+            };
+            let Device::Cuda(cuda) = &device else {
+                unreachable!()
+            };
+            let upload_cache = cuda.enable_cuda_graph_htod_cache();
+            let _ = predictor.predict(&image, &[point], None, false)?;
+            device.synchronize()?;
+            let stream = cuda.cuda_stream();
+            stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_RELAXED)
+                .map_err(|error| {
+                    candle_core::Error::Msg(format!("CUDA graph capture failed: {error}"))
+                })?;
+            let captured = predictor.predict(&image, &[point], None, false)?.masks;
+            let graph = stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|error| {
+                    candle_core::Error::Msg(format!("CUDA graph instantiation failed: {error}"))
+                })?
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("CUDA graph capture produced no graph".into())
+                })?;
+            device.synchronize()?;
+            Some((graph, captured, upload_cache))
+        } else {
+            None
+        };
         let mut samples = Vec::with_capacity(iterations);
         let mut last: Option<Tensor> = None;
         let mut stage_profile = None;
@@ -97,6 +151,16 @@ fn main() -> ExitCode {
         let mut decoder_profile = None;
         for iteration in 0..iterations {
             let start = Instant::now();
+            #[cfg(feature = "cuda")]
+            if let Some((graph, captured, _upload_cache)) = &graph_state {
+                graph.launch().map_err(|error| {
+                    candle_core::Error::Msg(format!("CUDA graph launch failed: {error}"))
+                })?;
+                device.synchronize()?;
+                samples.push(start.elapsed().as_secs_f64() * 1000.);
+                last = Some(captured.clone());
+                continue;
+            }
             if (profile_stages || profile_encoder || profile_decoder) && iteration == 0 {
                 let (features, profile) = if profile_encoder {
                     let (features, profile) = predictor.encode_image_profiled(&image)?;

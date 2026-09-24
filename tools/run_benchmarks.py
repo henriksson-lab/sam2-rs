@@ -17,6 +17,11 @@ parser.add_argument("--rust-checkpoint", type=Path, default=ROOT / "checkpoints/
 parser.add_argument("--python-checkpoint", type=Path, default=ROOT / "checkpoints/sam2.1_hiera_tiny.pt")
 parser.add_argument("--fixture", type=Path, default=ROOT / "checkpoints/bench_bedroom.safetensors")
 parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+parser.add_argument(
+    "--cuda-graph",
+    action="store_true",
+    help="capture and replay the identical static CUDA inference in both implementations",
+)
 parser.add_argument("--rust-features", default="", help="comma-separated Cargo features for the Rust benchmark")
 parser.add_argument(
     "--threads",
@@ -26,6 +31,11 @@ parser.add_argument(
 parser.add_argument(
     "--cpu-list",
     help="optional taskset CPU list applied identically to Rust and Python (for example 0-19)",
+)
+parser.add_argument(
+    "--alternate-order",
+    action="store_true",
+    help="run Python first in odd pairs to expose process-order/host-drift bias",
 )
 parser.add_argument(
     "--native",
@@ -38,6 +48,8 @@ parser.add_argument(
     help="print the fair comparison without replacing a README benchmark table",
 )
 args = parser.parse_args()
+if args.cuda_graph and args.device != "cuda":
+    parser.error("--cuda-graph requires --device cuda")
 
 binary = ROOT / "target/release/bench-static"
 # Let Cargo perform its inexpensive freshness check so runner edits never use
@@ -65,6 +77,8 @@ if args.repeats < 1:
 runs = []
 with tempfile.TemporaryDirectory(prefix="sam2-rs-bench-") as temp:
     benchmark_env = build_env.copy()
+    if args.cuda_graph:
+        benchmark_env["SAM2_CUDA_GRAPH"] = "1"
     if args.threads:
         benchmark_env.update({
             "RAYON_NUM_THREADS": str(args.threads),
@@ -75,16 +89,21 @@ with tempfile.TemporaryDirectory(prefix="sam2-rs-bench-") as temp:
     for repeat in range(args.repeats):
         rust_out = Path(temp) / f"rust-{repeat}.f32"
         python_out = Path(temp) / f"python-{repeat}.f32"
-        rust = run([str(binary), str(args.rust_checkpoint), str(args.fixture), str(args.iterations), str(rust_out), "--device", args.device], benchmark_env)
+        rust_command = [str(binary), str(args.rust_checkpoint), str(args.fixture), str(args.iterations), str(rust_out), "--device", args.device]
         python_command = [sys.executable, "tools/bench_static_python.py", str(args.python_checkpoint), str(args.fixture), "--iterations", str(args.iterations), "--output", str(python_out), "--device", args.device]
         if args.threads:
             python_command.extend(["--threads", str(args.threads)])
-        python = run(python_command, benchmark_env)
+        order = ("python", "rust") if args.alternate_order and repeat % 2 else ("rust", "python")
+        results = {}
+        for implementation in order:
+            command = rust_command if implementation == "rust" else python_command
+            results[implementation] = run(command, benchmark_env)
+        rust, python = results["rust"], results["python"]
         left, right = rust_out.read_bytes(), python_out.read_bytes()
         if len(left) != len(right) or len(left) % 4:
             raise RuntimeError(f"incompatible output sizes: {len(left)} and {len(right)}")
         parity = max(abs(a[0] - b[0]) for a, b in zip(struct.iter_unpack("<f", left), struct.iter_unpack("<f", right)))
-        runs.append({"rust": rust, "python": python, "max_abs_mask_error": parity})
+        runs.append({"order": "/".join(order), "rust": rust, "python": python, "max_abs_mask_error": parity})
 
 rust = {
     "median_ms": statistics.fmean(run["rust"]["median_ms"] for run in runs),
@@ -116,12 +135,31 @@ elif args.rust_features:
 else:
     marker = "BENCHMARK_RESULTS"
     heading = "## Reproducible performance baseline"
-rust_config = args.rust_features or "default"
+rust_config = args.rust_features or ("cuda" if args.device == "cuda" else "default")
+if args.cuda_graph:
+    rust_config += ",cuda-graph-both"
 if args.native:
     rust_config += ",target-cpu=native"
 cpu_pin_note = f", pinned to CPUs `{args.cpu_list}`" if args.cpu_list else ""
+order_note = ", alternating process order" if args.alternate_order else ""
+gpu_note = ""
+if args.device == "cuda":
+    try:
+        gpu = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version",
+                "--format=csv,noheader",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()[0].strip()
+        gpu_note = f" GPU: {gpu}."
+    except (FileNotFoundError, subprocess.CalledProcessError, IndexError):
+        gpu_note = " GPU identity unavailable."
 table = f"""<!-- {marker}_START -->
-_Generated on {platform.system()} {platform.release()}, CPU: {cpu_model}; fixture SHA-256: `{fixture_digest}`. CPU workers: `{args.threads or 'implementation default'}`{cpu_pin_note}. Peak RSS is Linux `VmHWM`._
+_Generated on {platform.system()} {platform.release()}, CPU: {cpu_model}.{gpu_note} Fixture SHA-256: `{fixture_digest}`. CPU workers: `{args.threads or 'implementation default'}`{cpu_pin_note}{order_note}. Peak RSS is Linux `VmHWM`._
 
 | Fixture / operation | Rust mean ms | Python mean ms | Rust/Python latency | Rust mean peak RSS MiB | Python mean peak RSS MiB | Rust/Python RSS | Max abs mask-logit error |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

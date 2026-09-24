@@ -103,3 +103,23 @@ workers, measured 1190.83 ms Rust versus
 Mean peak RSS was 588.2 MiB versus 1582.1 MiB (`0.372×`), with maximum
 mask-logit error `2.90871e-05`. Reproduce with
 `python3 tools/run_benchmarks.py --iterations 5 --repeats 4 --threads 8 --cpu-list 0-7 --rust-features cpu-flash-attention,cpu-glibc-vector-math --no-write`.
+
+## Reproducible GPU performance baseline
+
+<!-- BENCHMARK_GPU_RESULTS_START -->
+_Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz. GPU: Quadro RTX 5000, 570.133.20. Fixture SHA-256: `24271176ecdc`. CPU workers: `implementation default`, alternating process order. Peak RSS is Linux `VmHWM`._
+
+| Fixture / operation | Rust mean ms | Python mean ms | Rust/Python latency | Rust mean peak RSS MiB | Python mean peak RSS MiB | Rust/Python RSS | Max abs mask-logit error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bedroom/00089.jpg, Tiny static point prompt on cuda; Rust `cuda,cuda-graph-both` (4 independent runs × 10 measured iterations) | 67.97 | 67.16 | 1.012× | 470.8 | 1192.6 | 0.395× | 1.43051e-05 |
+<!-- BENCHMARK_GPU_RESULTS_END -->
+
+GPU timings synchronize device work around every sample. Peak RSS is host
+`VmHWM`, not device VRAM. The row uses CUDA graph capture and replay for both
+implementations because its image, checkpoint, shape, and prompt are static.
+Reproduce it with
+`python3 tools/run_gpu_benchmarks.py --cuda-graph --alternate-order --repeats 4 --iterations 10`.
+The retained eager path measured 75.90 ms Rust versus 67.20 ms PyTorch
+(`1.129×`) in an independent four-run batch. Graph mode removes Candle's
+remaining repeated allocation/event/launch bookkeeping; it does not change
+the model output.

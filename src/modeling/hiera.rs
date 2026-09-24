@@ -8,7 +8,7 @@ use std::{
 use candle_core::{DType, Result, Storage, Tensor};
 #[cfg(feature = "cpu-flash-attention")]
 use candle_nn::attention::{flash_attn_nhsd_f32, flash_attn_nhsd_f32_batched};
-use candle_nn::{LayerNorm, Module, VarBuilder, linear, ops::softmax};
+use candle_nn::{LayerNorm, Module, VarBuilder, linear, ops::softmax_last_dim};
 use rayon::prelude::*;
 
 use crate::{
@@ -40,6 +40,274 @@ struct MultiScaleAttentionProfile {
     cleanup_ms: f64,
     cleanup_attended_ms: f64,
     cleanup_qkv_ms: f64,
+}
+
+fn math_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda()
+        && k.dims() == v.dims()
+        && q.dim(0)? == k.dim(0)?
+        && q.dim(2)? == k.dim(2)?
+        && q.dim(3)? == k.dim(3)?
+        && q.dim(3)? <= 128
+        && std::env::var_os("SAM2_CUDA_MEM_EFFICIENT_ATTENTION").is_none_or(|value| value != "0")
+    {
+        return q.apply_op3_no_bwd(
+            k,
+            v,
+            &CudaMemEffAttention {
+                scale: scale as f32,
+            },
+        );
+    }
+    let q = q.permute((0, 2, 1, 3))?.contiguous()?.affine(scale, 0.)?;
+    let k = k.permute((0, 2, 1, 3))?.contiguous()?;
+    let v = v.permute((0, 2, 1, 3))?.contiguous()?;
+    let k_transposed = k.transpose(2, 3)?.contiguous()?;
+
+    let query_len = q.dim(2)?;
+    // Bound the otherwise 268 MiB f32 score tensor in SAM2 Tiny's global
+    // blocks. Four reverse-ordered full-model pairs favored 1024 rows, while
+    // producing byte-identical masks. Set the value to 0 for the unchunked
+    // fallback or use another power-of-two size for shape-level tuning.
+    let query_chunk = match std::env::var("SAM2_CUDA_ATTENTION_QUERY_CHUNK") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&value| value >= 128 && value.is_power_of_two()),
+        Err(_) => Some(1024),
+    };
+    let attended = if q.device().is_cuda() && query_chunk.is_some_and(|chunk| chunk < query_len) {
+        let chunk = query_chunk.unwrap();
+        let mut outputs = Vec::with_capacity(query_len.div_ceil(chunk));
+        for start in (0..query_len).step_by(chunk) {
+            let len = (query_len - start).min(chunk);
+            let scores = q.narrow(2, start, len)?.matmul(&k_transposed)?;
+            outputs.push(softmax_last_dim(&scores)?.matmul(&v)?);
+        }
+        Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2)?
+    } else {
+        softmax_last_dim(&q.matmul(&k_transposed)?)?.matmul(&v)?
+    };
+    attended.permute((0, 2, 1, 3))
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaMemEffAttention {
+    scale: f32,
+}
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn sam2_mem_eff_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        output: *mut f32,
+        batch: i32,
+        q_sequence: i32,
+        kv_sequence: i32,
+        heads: i32,
+        head_dim: i32,
+        q_stride_b: i64,
+        q_stride_m: i32,
+        q_stride_h: i32,
+        k_stride_b: i64,
+        k_stride_m: i32,
+        k_stride_h: i32,
+        v_stride_b: i64,
+        v_stride_m: i32,
+        v_stride_h: i32,
+        scale: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    fn sam2_max_pool2d_nhwc_f32(
+        input: *const f32,
+        output: *mut f32,
+        output_elements: u64,
+        height: u32,
+        width: u32,
+        channels: u32,
+        stride_b: u64,
+        stride_y: u64,
+        stride_x: u64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp3 for CudaMemEffAttention {
+    fn name(&self) -> &'static str {
+        "sam2-memory-efficient-attention-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _q: &candle_core::CpuStorage,
+        _q_l: &candle_core::Layout,
+        _k: &candle_core::CpuStorage,
+        _k_l: &candle_core::Layout,
+        _v: &candle_core::CpuStorage,
+        _v_l: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("memory-efficient attention is only implemented for cuda")
+    }
+
+    fn cuda_fwd(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &candle_core::Layout,
+        k: &candle_core::CudaStorage,
+        k_l: &candle_core::Layout,
+        v: &candle_core::CudaStorage,
+        v_l: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
+            candle_core::bail!("memory-efficient attention only supports f32")
+        }
+        let (batch, q_sequence, heads, head_dim) = q_l.shape().dims4()?;
+        let (k_batch, kv_sequence, k_heads, k_head_dim) = k_l.shape().dims4()?;
+        if v_l.shape() != k_l.shape()
+            || batch != k_batch
+            || heads != k_heads
+            || head_dim != k_head_dim
+            || head_dim > 128
+        {
+            candle_core::bail!("unsupported memory-efficient attention shape")
+        }
+        let q_stride = q_l.stride();
+        let k_stride = k_l.stride();
+        let v_stride = v_l.stride();
+        if q_stride[3] != 1 || k_stride[3] != 1 || v_stride[3] != 1 {
+            candle_core::bail!("attention head dimensions must be contiguous")
+        }
+        let dev = q.device();
+        let stream = dev.cuda_stream();
+        let q = q.as_cuda_slice::<f32>()?.slice(q_l.start_offset()..);
+        let k = k.as_cuda_slice::<f32>()?.slice(k_l.start_offset()..);
+        let v = v.as_cuda_slice::<f32>()?.slice(v_l.start_offset()..);
+        // SAFETY: The external kernel writes every element in the validated output shape.
+        let mut output = unsafe { dev.alloc::<f32>(q_l.shape().elem_count())? };
+        let (q_ptr, q_guard) = q.device_ptr(&stream);
+        let (k_ptr, k_guard) = k.device_ptr(&stream);
+        let (v_ptr, v_guard) = v.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_mem_eff_f32(
+                q_ptr as *const f32,
+                k_ptr as *const f32,
+                v_ptr as *const f32,
+                output_ptr as *mut f32,
+                batch as i32,
+                q_sequence as i32,
+                kv_sequence as i32,
+                heads as i32,
+                head_dim as i32,
+                q_stride[0] as i64,
+                q_stride[1] as i32,
+                q_stride[2] as i32,
+                k_stride[0] as i64,
+                k_stride[1] as i32,
+                k_stride[2] as i32,
+                v_stride[0] as i64,
+                v_stride[1] as i32,
+                v_stride[2] as i32,
+                self.scale,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("memory-efficient attention CUDA launch failed with status {status}")
+        }
+        drop((q_guard, k_guard, v_guard, output_guard));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: dev.clone(),
+            },
+            q_l.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaNhwcMaxPool {
+    height: usize,
+    width: usize,
+    channels: usize,
+    stride_y: usize,
+    stride_x: usize,
+    output_shape: candle_core::Shape,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for CudaNhwcMaxPool {
+    fn name(&self) -> &'static str {
+        "sam2-max-pool2d-nhwc-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("NHWC max pool is only implemented for cuda")
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        if storage.dtype() != DType::F32 || layout.stride()[3] != 1 {
+            candle_core::bail!("NHWC max pool requires f32 with contiguous channels")
+        }
+        let dev = storage.device();
+        let stream = dev.cuda_stream();
+        let input = storage
+            .as_cuda_slice::<f32>()?
+            .slice(layout.start_offset()..);
+        let output_elements = self.output_shape.elem_count();
+        // SAFETY: The kernel writes each element in the validated output shape once.
+        let mut output = unsafe { dev.alloc::<f32>(output_elements)? };
+        let (input_ptr, input_guard) = input.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_max_pool2d_nhwc_f32(
+                input_ptr as *const f32,
+                output_ptr as *mut f32,
+                output_elements as u64,
+                self.height as u32,
+                self.width as u32,
+                self.channels as u32,
+                layout.stride()[0] as u64,
+                self.stride_y as u64,
+                self.stride_x as u64,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("NHWC max-pool CUDA launch failed with status {status}")
+        }
+        drop((input_guard, output_guard));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: dev.clone(),
+            },
+            self.output_shape.clone(),
+        ))
+    }
 }
 
 impl MultiScaleAttention {
@@ -107,16 +375,8 @@ impl MultiScaleAttention {
                 self.dim_out,
             ))?);
         }
-        let q = q.permute((0, 2, 1, 3))?.contiguous()?;
-        let k = k.permute((0, 2, 1, 3))?.contiguous()?;
-        let v = v.permute((0, 2, 1, 3))?.contiguous()?;
-        let attention = softmax(
-            &q.matmul(&k.transpose(2, 3)?.contiguous()?)?
-                .affine(1. / (head_dim as f64).sqrt(), 0.)?,
-            3,
-        )?;
         self.proj.forward_fused_bias_cpu(
-            &attention.matmul(&v)?.permute((0, 2, 1, 3))?.reshape((
+            &math_attention(&q, &k, &v, 1. / (head_dim as f64).sqrt())?.reshape((
                 batch,
                 height,
                 width,
@@ -185,32 +445,20 @@ impl MultiScaleAttention {
                 flash_attn_nhsd_f32_batched(&q, &k, &v, 1. / (head_dim as f32).sqrt())?
                     .reshape((batch, height, width, self.dim_out))?
             } else {
-                let q = q.permute((0, 2, 1, 3))?.contiguous()?;
-                let k = k.permute((0, 2, 1, 3))?.contiguous()?;
-                let v = v.permute((0, 2, 1, 3))?.contiguous()?;
-                softmax(
-                    &q.matmul(&k.transpose(2, 3)?.contiguous()?)?
-                        .affine(1. / (head_dim as f64).sqrt(), 0.)?,
-                    3,
-                )?
-                .matmul(&v)?
-                .permute((0, 2, 1, 3))?
-                .reshape((batch, height, width, self.dim_out))?
+                math_attention(&q, &k, &v, 1. / (head_dim as f64).sqrt())?.reshape((
+                    batch,
+                    height,
+                    width,
+                    self.dim_out,
+                ))?
             };
         #[cfg(not(feature = "cpu-flash-attention"))]
-        let attended = {
-            let q = q.permute((0, 2, 1, 3))?.contiguous()?;
-            let k = k.permute((0, 2, 1, 3))?.contiguous()?;
-            let v = v.permute((0, 2, 1, 3))?.contiguous()?;
-            softmax(
-                &q.matmul(&k.transpose(2, 3)?.contiguous()?)?
-                    .affine(1. / (head_dim as f64).sqrt(), 0.)?,
-                3,
-            )?
-            .matmul(&v)?
-            .permute((0, 2, 1, 3))?
-            .reshape((batch, height, width, self.dim_out))?
-        };
+        let attended = math_attention(&q, &k, &v, 1. / (head_dim as f64).sqrt())?.reshape((
+            batch,
+            height,
+            width,
+            self.dim_out,
+        ))?;
         attended.device().synchronize()?;
         let kernel_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
@@ -694,6 +942,25 @@ impl Hiera {
 }
 
 fn pool_nhwc(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() && x.dtype() == DType::F32 {
+        let (batch, height, width, channels) = x.dims4()?;
+        if height > 0 && width > 0 && height % 2 == 0 && width % 2 == 0 && x.stride()[3] == 1 {
+            return x.apply_op1_no_bwd(&CudaNhwcMaxPool {
+                height,
+                width,
+                channels,
+                stride_y: x.stride()[1],
+                stride_x: x.stride()[2],
+                output_shape: candle_core::Shape::from_dims(&[
+                    batch,
+                    height / 2,
+                    width / 2,
+                    channels,
+                ]),
+            });
+        }
+    }
     if let Some(pooled) = pool_nhwc_cpu_f32(x)? {
         return Ok(pooled);
     }
@@ -710,6 +977,33 @@ fn pool_nhwc_generic(x: &Tensor) -> Result<Tensor> {
 /// view into NHWC first materializes its strided pixels; the pool needs only
 /// four source pixel reads per output and can write final NHSD storage once.
 fn pool_nhsd_query_cpu_f32(q: &Tensor, height: usize, width: usize) -> Result<Option<Tensor>> {
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda()
+        && q.dtype() == DType::F32
+        && height > 0
+        && width > 0
+        && height % 2 == 0
+        && width % 2 == 0
+        && q.stride()[3] == 1
+    {
+        let (batch, pixels, heads, head_dim) = q.dims4()?;
+        if pixels == height * width && q.stride()[2] == head_dim {
+            let pooled = q.apply_op1_no_bwd(&CudaNhwcMaxPool {
+                height,
+                width,
+                channels: heads * head_dim,
+                stride_y: width * q.stride()[1],
+                stride_x: q.stride()[1],
+                output_shape: candle_core::Shape::from_dims(&[
+                    batch,
+                    height / 2 * (width / 2),
+                    heads,
+                    head_dim,
+                ]),
+            })?;
+            return Ok(Some(pooled));
+        }
+    }
     if !q.device().is_cpu()
         || q.dtype() != DType::F32
         || height == 0

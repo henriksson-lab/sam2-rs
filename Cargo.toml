@@ -20,6 +20,9 @@ rayon = "1.11"
 [dev-dependencies]
 tempfile = "3"
 
+[build-dependencies]
+cudaforge = "0.1.6"
+
 [features]
 default = []
 # SAM2 is convolution-heavy; CUDA without cuDNN would benchmark a fallback

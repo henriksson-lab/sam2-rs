@@ -254,6 +254,29 @@ with torch.inference_mode():
     cached_image_output = model.forward_image(image) if args.decoder_only else None
     if args.device == "cuda":
         torch.cuda.synchronize()
+    cuda_graph = None
+    graph_masks = None
+    if (
+        args.device == "cuda"
+        and not args.decoder_only
+        and not args.profile_stages
+        and not args.profile_encoder
+        and not args.profile_decoder
+        and os.environ.get("SAM2_CUDA_GRAPH") == "1"
+    ):
+        # Match the Rust static-input graph path.  PyTorch requires capture
+        # warmup on a side stream so lazy cuBLAS/cuDNN initialization is not
+        # recorded in the graph.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                infer()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph):
+            graph_masks = infer()
+        torch.cuda.synchronize()
     samples = []
     stage_profile = None
     encoder_profile = None
@@ -282,7 +305,11 @@ with torch.inference_mode():
                 torch.cuda.synchronize()
             stage_profile = (encoder_ms, (time.perf_counter() - decoder_start) * 1000)
         else:
-            masks = decode(cached_image_output) if args.decoder_only else infer()
+            if cuda_graph is not None:
+                cuda_graph.replay()
+                masks = graph_masks
+            else:
+                masks = decode(cached_image_output) if args.decoder_only else infer()
             if args.device == "cuda":
                 torch.cuda.synchronize()
         samples.append((time.perf_counter() - start) * 1000)
