@@ -16,6 +16,9 @@ candle-nn = { path = "/home/mahogny/github/claude/candle/candle-nn" }
 safetensors = "0.8.0"
 thiserror = "2"
 rayon = "1.11"
+hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["ureq"] }
+image = { version = "=0.25.9", optional = true, default-features = false, features = ["jpeg", "png"] }
+ffmpeg-next = { version = "9.0.0", optional = true, default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -25,6 +28,14 @@ cudaforge = "0.1.6"
 
 [features]
 default = []
+# Download published checkpoints from the Hugging Face Hub into its standard
+# content-addressed cache. Authentication and cache overrides use HF_* env vars.
+huggingface = ["dep:hf-hub"]
+# Decode JPEG/PNG images and numerically ordered JPEG frame directories.
+image-decoding = ["dep:image"]
+# Decode encoded video files through the system FFmpeg libraries. This also
+# enables image decoding so callers can accept either upstream input form.
+video-decoding = ["image-decoding", "dep:ffmpeg-next"]
 # SAM2 is convolution-heavy; CUDA without cuDNN would benchmark a fallback
 # implementation rather than a meaningful counterpart to PyTorch CUDA.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-core/cudnn", "candle-nn/cudnn"]

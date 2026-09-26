@@ -255,6 +255,15 @@ pub struct Sam2InteractiveVideoPredictor {
 }
 
 impl Sam2VideoPredictor {
+    /// Downloads the published checkpoint through the Hugging Face cache and
+    /// constructs the predictor on CPU.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained(variant: Sam2Variant) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1(variant, path)
+    }
+
     pub fn load_sam2_1(variant: Sam2Variant, path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             model: Sam2Base::load_sam2_1_with_decoder_config(
@@ -444,6 +453,15 @@ impl Sam2VideoPredictor {
 }
 
 impl Sam2MultiObjectVideoPredictor {
+    /// Downloads the published checkpoint through the Hugging Face cache and
+    /// constructs the predictor on CPU.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained(variant: Sam2Variant) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1(variant, path)
+    }
+
     pub fn load_sam2_1(variant: Sam2Variant, path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             model: Sam2Base::load_sam2_1(variant, path)?,
@@ -517,6 +535,28 @@ impl Sam2MultiObjectVideoPredictor {
 }
 
 impl Sam2InteractiveVideoPredictor {
+    /// Downloads the published checkpoint through the Hugging Face cache and
+    /// constructs the editable video predictor on CPU.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained(variant: Sam2Variant, config: VideoPredictorConfig) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1(variant, path, config)
+    }
+
+    /// Downloads the published checkpoint and constructs the editable video
+    /// predictor on `device`.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained_on_device(
+        variant: Sam2Variant,
+        device: &Device,
+        config: VideoPredictorConfig,
+    ) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1_on_device(variant, path, device, config)
+    }
+
     pub fn load_sam2_1(
         variant: Sam2Variant,
         path: impl AsRef<Path>,
@@ -568,6 +608,64 @@ impl Sam2InteractiveVideoPredictor {
             model_states: BTreeMap::new(),
             outputs: BTreeMap::new(),
         })
+    }
+
+    /// Initializes a session from already decoded owned frames.
+    #[cfg(feature = "image-decoding")]
+    pub fn init_state_from_decoded_video(
+        &self,
+        video: &crate::DecodedVideo,
+    ) -> Result<InteractiveVideoSession> {
+        self.init_state(&video.inputs())
+    }
+
+    /// Consumes decoded frames, releasing each RGB allocation immediately
+    /// after its normalized model tensor has been prepared.
+    #[cfg(feature = "image-decoding")]
+    pub fn init_state_from_owned_video(
+        &self,
+        video: crate::DecodedVideo,
+    ) -> Result<InteractiveVideoSession> {
+        let width = video.original_width();
+        let height = video.original_height();
+        let decoded = video.into_frames();
+        let num_frames = decoded.len();
+        let transforms = Sam2ImageTransforms::default();
+        let device = self.model.device();
+        let frames = decoded
+            .into_iter()
+            .map(|frame| {
+                let (pixels, frame_width, frame_height) = frame.into_parts();
+                Ok(transforms
+                    .prepare_rgb8(&pixels, frame_width, frame_height, device)?
+                    .tensor)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(InteractiveVideoSession {
+            frames,
+            state: VideoInferenceState::with_video(width, height, num_frames)?,
+            model_states: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        })
+    }
+
+    /// Decodes a numerically named JPEG directory and initializes a session.
+    #[cfg(feature = "image-decoding")]
+    pub fn init_state_from_jpeg_directory(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<InteractiveVideoSession> {
+        let video = crate::load_jpeg_directory(path)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        self.init_state_from_owned_video(video)
+    }
+
+    /// Decodes an encoded video with FFmpeg and initializes a session.
+    #[cfg(feature = "video-decoding")]
+    pub fn init_state_from_video(&self, path: impl AsRef<Path>) -> Result<InteractiveVideoSession> {
+        let video = crate::decode_video(path)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        self.init_state_from_owned_video(video)
     }
 
     fn memory(output: &Sam2FrameOutput) -> crate::MemoryFrame {
@@ -1073,6 +1171,23 @@ impl Sam2InteractiveVideoPredictor {
 }
 
 impl Sam2ImagePredictor {
+    /// Downloads the published checkpoint through the Hugging Face cache and
+    /// constructs the image predictor on CPU.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained(variant: Sam2Variant) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1(variant, path)
+    }
+
+    /// Downloads the published checkpoint and constructs it on `device`.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained_on_device(variant: Sam2Variant, device: &Device) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1_on_device(variant, path, device)
+    }
+
     /// Loads a converted safetensors state dict. The model is initialized only
     /// after its checkpoint keys have been checked by `CheckpointIndex`.
     pub fn load_sam2_1_hiera_tiny(path: impl AsRef<Path>) -> Result<Self> {
@@ -1163,6 +1278,14 @@ impl Sam2ImagePredictor {
             is_batch: false,
         });
         Ok(())
+    }
+
+    /// Decodes an image file and caches its image embedding.
+    #[cfg(feature = "image-decoding")]
+    pub fn set_image_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let image = crate::decode_image(path)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        self.set_image(image.pixels(), image.width(), image.height())
     }
 
     /// Encodes all RGB8 images in one backbone invocation and retains the
@@ -1674,6 +1797,15 @@ impl Sam2ImagePredictor {
 }
 
 impl Sam2AutomaticMaskGenerator {
+    /// Downloads the published checkpoint through the Hugging Face cache and
+    /// constructs the automatic mask generator on CPU.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained(variant: Sam2Variant, config: AutomaticMaskConfig) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1(variant, path, config)
+    }
+
     pub fn load_sam2_1(
         variant: Sam2Variant,
         path: impl AsRef<Path>,
@@ -1743,6 +1875,14 @@ impl Sam2AutomaticMaskGenerator {
             .into_iter()
             .map(|candidate| candidate.finish(self.config.output_mode))
             .collect::<Result<Vec<_>>>()?)
+    }
+
+    /// Decodes an image file and generates masks for it.
+    #[cfg(feature = "image-decoding")]
+    pub fn generate_path(&self, path: impl AsRef<Path>) -> Result<Vec<AutomaticMask>> {
+        let image = crate::decode_image(path)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        self.generate_rgb8(image.pixels(), image.width(), image.height())
     }
 
     fn process_crop(

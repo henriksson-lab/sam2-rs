@@ -62,6 +62,50 @@ Here `rgb_bytes` is interleaved RGB8 and `frames` is a slice of
 `(&[u8], width, height)` tuples. See [PARITY.md](PARITY.md) for reproducible
 Python/Rust conformance commands.
 
+## Optional downloading and media decoding
+
+The default build remains network- and codec-free. Enable only the integrations
+an application needs:
+
+```toml
+sam2-rs = { version = "0.1", features = ["huggingface", "video-decoding"] }
+```
+
+`huggingface` adds cached checkpoint retrieval and `from_pretrained`
+constructors. It honors the standard `HF_TOKEN`, `HF_HOME`, `HF_HUB_CACHE`, and
+`HF_ENDPOINT` environment variables:
+
+```rust,no_run
+use sam2_rs::{Sam2ImagePredictor, Sam2Variant};
+
+let mut predictor = Sam2ImagePredictor::from_pretrained(Sam2Variant::HieraTiny)?;
+predictor.set_image_path("input.jpg")?;
+```
+
+Use `HuggingFaceCheckpoint::for_variant(variant)` when a pinned revision,
+custom cache directory, offline-only lookup, or forced refresh is needed.
+
+`image-decoding` accepts JPEG/PNG images and upstream-style directories whose
+JPEG filenames have numeric stems. `video-decoding` includes image decoding and
+adds encoded-video support through the system FFmpeg libraries:
+
+```rust,no_run
+use sam2_rs::{Sam2InteractiveVideoPredictor, Sam2Variant, VideoPredictorConfig};
+
+let predictor = Sam2InteractiveVideoPredictor::from_pretrained(
+    Sam2Variant::HieraTiny,
+    VideoPredictorConfig::default(),
+)?;
+let jpeg_session = predictor.init_state_from_jpeg_directory("frames")?;
+let mp4_session = predictor.init_state_from_video("clip.mp4")?;
+# let _ = (jpeg_session, mp4_session);
+```
+
+Building `video-decoding` requires FFmpeg development packages discoverable by
+`pkg-config` (on Debian/Ubuntu: `libavcodec-dev`, `libavformat-dev`,
+`libavutil-dev`, and `libswscale-dev`). `decode_video_prefix` is available for
+bounded previews without retaining an entire video in memory.
+
 ## Reproducible performance baseline
 
 Run `python3 tools/run_benchmarks.py` after following [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md). The generated table compares separate fresh CPU processes over an identical frozen real-image fixture; ratios below `1.0×` favor Rust. Use `--threads N` to cap Rayon and PyTorch to the same CPU-worker count; this is required when comparing thread-count tuning.

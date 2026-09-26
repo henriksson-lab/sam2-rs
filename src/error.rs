@@ -44,4 +44,10 @@ pub enum Error {
 
     #[error("invalid SAM2 configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("{operation}: {message}")]
+    Integration {
+        operation: &'static str,
+        message: String,
+    },
 }
