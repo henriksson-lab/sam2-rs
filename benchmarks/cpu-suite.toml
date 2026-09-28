@@ -1,0 +1,440 @@
+schema_version = 1
+
+[suite]
+name = "sam2-device-parity"
+devices = ["cuda", "cpu"]
+headline_weights = { cuda = 70, cpu = 30 }
+primary_workers = 20
+portability_workers = [8, 20]
+cpu_affinity = { "8" = "0-7", "20" = "0-19" }
+paired_processes = 4
+alternate_order = true
+minimum_measured_seconds = 2.0
+# A retained headline row must not hide a thermally throttled, preempted, or
+# otherwise pathological process inside its arithmetic mean.
+max_repeat_spread_ratio = 1.25
+rust_features = ["cpu-flash-attention", "cpu-glibc-vector-math"]
+
+[gates.p0]
+weighted_latency_ratio_max = 1.00
+cell_latency_ratio_max = 1.10
+weighted_rss_ratio_max = 0.80
+cell_rss_ratio_max = 1.00
+passing_cell_regression_max = 0.03
+
+[gates.gpu_p0]
+weighted_latency_ratio_max = 1.00
+cell_latency_ratio_max = 1.10
+weighted_device_memory_ratio_max = 1.00
+cell_device_memory_ratio_max = 1.10
+cell_host_rss_ratio_max = 1.00
+passing_cell_regression_max = 0.03
+require_eager = true
+
+[gates.p1]
+weighted_latency_ratio_max = 1.05
+cell_latency_ratio_max = 1.15
+cell_rss_ratio_max = 1.00
+weighted_device_memory_ratio_max = 1.00
+cell_device_memory_ratio_max = 1.10
+
+[parity]
+mask_logit_max_abs = 0.0002
+mask_logit_mean_abs = 0.00003
+exact_fields = ["frame_indices", "object_ids", "rles", "thresholded_masks"]
+
+[parity.video]
+# Autoregressive float drift accumulates over dozens of memory updates. The
+# user-visible thresholded masks must remain exact; selected logits use this
+# independently reported envelope rather than the single-frame image bound.
+mask_logit_max_abs = 0.1
+mask_logit_mean_abs = 0.01
+threshold_masks_exact = true
+
+[parity.video_edit]
+# Three independently propagated objects include a correction and reverse
+# pass. Floating-point drift is largest on the corrected frame, while the
+# thresholded masks remain bit-exact. Keep this distinct from ordinary video
+# propagation so its slightly wider bound cannot hide a V2/V4 regression.
+mask_logit_max_abs = 0.12
+mask_logit_mean_abs = 0.01
+threshold_masks_exact = true
+
+[parity.large_model]
+# The deeper Base-Plus/Large encoders accumulate slightly more backend-order
+# drift than Tiny/Small. Mean logit error and threshold decisions remain under
+# the ordinary image requirements; keep the wider maximum local to M1.
+mask_logit_max_abs = 0.0005
+mask_logit_mean_abs = 0.00003
+threshold_masks_exact = true
+
+[parity.public_image]
+# Public RGB8 APIs include independent resize implementations before reaching
+# the already-gated model tensors. Keep their observed maximum local to API
+# lifetime coverage; mean drift and user-visible threshold decisions retain
+# the ordinary image requirements.
+mask_logit_max_abs = 0.0005
+mask_logit_mean_abs = 0.00003
+threshold_masks_exact = true
+
+[variants.tiny]
+rust = "tiny"
+python_config = "configs/sam2.1/sam2.1_hiera_t.yaml"
+rust_checkpoint = "checkpoints/sam2.1_hiera_tiny.safetensors"
+python_checkpoint = "checkpoints/sam2.1_hiera_tiny.pt"
+
+[variants.small]
+rust = "small"
+python_config = "configs/sam2.1/sam2.1_hiera_s.yaml"
+rust_checkpoint = "checkpoints/sam2.1_hiera_small.safetensors"
+python_checkpoint = "checkpoints/sam2.1_hiera_small.pt"
+
+[variants.base_plus]
+rust = "base-plus"
+python_config = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+rust_checkpoint = "checkpoints/sam2.1_hiera_base_plus.safetensors"
+python_checkpoint = "checkpoints/sam2.1_hiera_base_plus.pt"
+
+[variants.large]
+rust = "large"
+python_config = "configs/sam2.1/sam2.1_hiera_l.yaml"
+rust_checkpoint = "checkpoints/sam2.1_hiera_large.safetensors"
+python_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
+
+# Coordinates below are in source-image pixels and come from the upstream
+# SAM2 notebooks where available. The fixture builder freezes scaled model
+# coordinates and decoded RGB bytes so both implementations see identical data.
+[fixtures.bedroom]
+source = "vendor/segment-anything-2/notebooks/videos/bedroom/00089.jpg"
+license = "Apache-2.0 (SAM2 example asset)"
+positive_points = [[210.0, 350.0]]
+negative_points = [[82.0, 410.0]]
+correction_points = [[250.0, 220.0]]
+box = [160.0, 180.0, 360.0, 500.0]
+
+[fixtures.truck]
+source = "vendor/segment-anything-2/notebooks/images/truck.jpg"
+license = "Apache-2.0 (SAM2 example asset)"
+positive_points = [[500.0, 375.0], [1125.0, 625.0]]
+negative_points = [[575.0, 750.0]]
+correction_points = [[650.0, 750.0]]
+box = [425.0, 600.0, 700.0, 875.0]
+
+[fixtures.groceries]
+source = "vendor/segment-anything-2/notebooks/images/groceries.jpg"
+license = "Apache-2.0 (SAM2 example asset)"
+positive_points = [[400.0, 300.0], [630.0, 300.0]]
+negative_points = [[550.0, 420.0]]
+correction_points = [[375.0, 270.0]]
+box = [450.0, 170.0, 520.0, 350.0]
+
+[fixtures.cars]
+source = "vendor/segment-anything-2/notebooks/images/cars.jpg"
+license = "Apache-2.0 (SAM2 example asset)"
+positive_points = [[1130.0, 760.0], [1730.0, 720.0]]
+negative_points = [[780.0, 880.0]]
+correction_points = [[1450.0, 650.0]]
+box = [850.0, 420.0, 1510.0, 1050.0]
+
+[fixtures.portrait]
+derived_from = "cars"
+transform = "crop:center:900x1500"
+license = "Apache-2.0 (derived from SAM2 example asset)"
+positive_points = [[450.0, 750.0]]
+negative_points = [[150.0, 1250.0]]
+correction_points = [[620.0, 560.0]]
+box = [180.0, 320.0, 760.0, 1160.0]
+
+[fixtures.odd]
+derived_from = "truck"
+transform = "resize:1277x731"
+license = "Apache-2.0 (derived from SAM2 example asset)"
+positive_points = [[355.0, 274.0]]
+negative_points = [[413.0, 548.0]]
+correction_points = [[468.0, 548.0]]
+box = [305.0, 439.0, 503.0, 640.0]
+
+[videos.bedroom32]
+source = "vendor/segment-anything-2/notebooks/videos/bedroom"
+frames = 32
+start = 0
+stride = 1
+license = "Apache-2.0 (SAM2 example asset)"
+
+[videos.bedroom128]
+source = "vendor/segment-anything-2/notebooks/videos/bedroom"
+frames = 128
+start = 0
+stride = 1
+license = "Apache-2.0 (SAM2 example asset)"
+
+[videos.bedroom_mp4]
+source = "vendor/segment-anything-2/notebooks/videos/bedroom.mp4"
+frames = 32
+start = 0
+stride = 1
+license = "Apache-2.0 (SAM2 example asset)"
+
+# Motion-diverse upstream gallery footage. Sampling across the clip avoids
+# turning video coverage into another near-static bedroom-only measurement.
+[videos.juggle_mp4]
+source = "vendor/segment-anything-2/demo/data/gallery/05_default_juggle.mp4"
+frames = 32
+start = 0
+stride = 4
+license = "Apache-2.0 (SAM2 demo gallery asset)"
+
+# `operation` is an API-stable runner operation, not prose. Every matrix row
+# expands to one independently runnable process per variant/fixture pair.
+[[cells]]
+id = "I1"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 12
+gpu_modes = ["eager"]
+family = "image"
+operation = "first_point"
+variants = ["tiny"]
+fixtures = ["bedroom", "truck", "groceries", "cars", "portrait", "odd"]
+weight = 14
+warmups = 1
+iterations = 5
+gpu_iterations = 30
+
+[[cells]]
+id = "I2"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 6
+gpu_modes = ["eager"]
+family = "image"
+operation = "first_rich"
+variants = ["tiny"]
+fixtures = ["bedroom", "groceries", "portrait"]
+weight = 8
+warmups = 1
+iterations = 5
+gpu_iterations = 30
+
+[[cells]]
+id = "I3"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 12
+gpu_modes = ["eager", "graph"]
+family = "cached_decoder"
+operation = "cached_prompt_sequence"
+variants = ["tiny"]
+fixtures = ["bedroom", "groceries"]
+weight = 10
+warmups = 2
+iterations = 20
+gpu_iterations = 512
+
+[[cells]]
+id = "I4"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 8
+gpu_modes = ["eager", "graph"]
+family = "cached_decoder"
+operation = "cached_batch_and_prior_mask"
+variants = ["tiny"]
+fixtures = ["bedroom", "cars"]
+weight = 8
+warmups = 2
+iterations = 20
+gpu_iterations = 100
+
+[[cells]]
+id = "V1"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 5
+gpu_modes = ["eager"]
+family = "video"
+operation = "video_init"
+variants = ["tiny"]
+fixtures = ["bedroom32"]
+weight = 7
+warmups = 1
+iterations = 1
+gpu_iterations = 8
+
+[[cells]]
+id = "V2"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 14
+gpu_modes = ["eager", "graph"]
+family = "video"
+operation = "video_forward_one"
+variants = ["tiny"]
+fixtures = ["bedroom32"]
+weight = 13
+warmups = 1
+iterations = 1
+
+[[cells]]
+id = "V3"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 12
+gpu_modes = ["eager"]
+family = "video"
+operation = "video_edit_three"
+variants = ["tiny"]
+fixtures = ["bedroom32"]
+weight = 12
+warmups = 1
+iterations = 1
+
+[[cells]]
+id = "V4"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 7
+gpu_modes = ["eager"]
+family = "video"
+operation = "video_long_lifetime"
+variants = ["tiny"]
+fixtures = ["bedroom128"]
+weight = 8
+warmups = 1
+iterations = 1
+
+[[cells]]
+id = "A1"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 8
+gpu_modes = ["eager"]
+family = "amg"
+operation = "amg_practical"
+variants = ["tiny"]
+fixtures = ["groceries", "cars"]
+weight = 8
+warmups = 1
+iterations = 1
+gpu_iterations = 4
+
+[[cells]]
+id = "A2"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 4
+gpu_modes = ["eager"]
+family = "amg"
+operation = "amg_default"
+variants = ["tiny"]
+fixtures = ["groceries"]
+weight = 5
+warmups = 1
+iterations = 1
+
+[[cells]]
+id = "L1"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 3
+gpu_modes = ["eager"]
+family = "startup"
+operation = "model_load"
+variants = ["tiny"]
+fixtures = ["bedroom"]
+weight = 3
+warmups = 0
+iterations = 1
+
+[[cells]]
+id = "S1"
+tier = "p0"
+devices = ["cuda", "cpu"]
+gpu_weight = 5
+gpu_modes = ["eager"]
+family = "scaling"
+operation = "first_and_cached"
+variants = ["small"]
+fixtures = ["bedroom"]
+weight = 4
+warmups = 1
+iterations = 3
+gpu_iterations = 24
+
+[[cells]]
+id = "W1"
+tier = "p1"
+family = "workers"
+operation = "worker_scaling"
+variants = ["tiny"]
+fixtures = ["I1", "I3", "V2", "A1"]
+workers = [8, 20]
+weight = 1
+warmups = 1
+iterations = 3
+
+[[cells]]
+id = "M1"
+tier = "p1"
+devices = ["cuda", "cpu"]
+gpu_tier = "p0"
+gpu_weight = 4
+gpu_modes = ["eager"]
+family = "scaling"
+operation = "first_and_cached"
+parity_profile = "large_model"
+variants = ["base_plus", "large"]
+fixtures = ["bedroom"]
+weight = 1
+warmups = 1
+iterations = 3
+
+[[cells]]
+id = "B1"
+tier = "p1"
+family = "batch"
+operation = "image_batch"
+variants = ["tiny"]
+fixtures = ["bedroom", "truck", "groceries", "portrait"]
+batches = [2, 4]
+weight = 1
+warmups = 1
+iterations = 3
+
+[[cells]]
+id = "V5"
+tier = "p1"
+devices = ["cuda", "cpu"]
+family = "io"
+operation = "encoded_video_init"
+variants = ["tiny"]
+fixtures = ["bedroom32", "bedroom_mp4", "juggle_mp4"]
+weight = 1
+warmups = 0
+iterations = 3
+
+[[cells]]
+id = "P1"
+tier = "p1"
+family = "prompts"
+operation = "prompt_diversity"
+variants = ["tiny"]
+fixtures = ["bedroom"]
+point_counts = [0, 1, 8, 32]
+weight = 1
+warmups = 1
+iterations = 15
+
+[[cells]]
+id = "R1"
+tier = "p1"
+devices = ["cuda", "cpu"]
+family = "lifetime"
+operation = "repeated_lifetime"
+variants = ["tiny"]
+fixtures = ["bedroom", "bedroom32"]
+parity_profile_by_fixture = { bedroom = "public_image", bedroom32 = "video" }
+sessions = 10
+weight = 1
+warmups = 1
+iterations = 1

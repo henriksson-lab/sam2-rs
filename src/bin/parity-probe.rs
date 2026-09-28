@@ -37,6 +37,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let input_fixture = args.next();
     let device = Device::Cpu;
     let model_vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device) }.unwrap();
@@ -46,10 +47,26 @@ fn main() -> ExitCode {
     let image_encoder = ImageEncoder::load(&config, model_vb.pp("image_encoder")).unwrap();
     let prompt_encoder = PromptEncoder::load(&config, model_vb.pp("sam_prompt_encoder")).unwrap();
     let decoder = MaskDecoder::load(model_vb.pp("sam_mask_decoder")).unwrap();
-    let image = Tensor::zeros((1, 3, 1024, 1024), DType::F32, &device).unwrap();
-    let points = Tensor::from_vec(vec![512f32, 512.], (1, 1, 2), &device).unwrap();
-    let labels = Tensor::from_vec(vec![1i64], (1, 1), &device).unwrap();
-    let features = image_encoder.forward(&image).unwrap();
+    let (image, points, labels) = if let Some(path) = input_fixture {
+        let mut tensors = candle_core::safetensors::load(path, &device).unwrap();
+        (
+            tensors.remove("image").unwrap(),
+            tensors.remove("points").unwrap(),
+            tensors.remove("labels").unwrap(),
+        )
+    } else {
+        (
+            Tensor::zeros((1, 3, 1024, 1024), DType::F32, &device).unwrap(),
+            Tensor::from_vec(vec![512f32, 512.], (1, 1, 2), &device).unwrap(),
+            Tensor::from_vec(vec![1i64], (1, 1), &device).unwrap(),
+        )
+    };
+    let mut features = image_encoder.forward(&image).unwrap();
+    let no_mem_embed = model_vb.get((1, 1, 256), "no_mem_embed").unwrap();
+    features.vision_features = features
+        .vision_features
+        .broadcast_add(&no_mem_embed.reshape((1, 256, 1, 1)).unwrap())
+        .unwrap();
     let prompts = prompt_encoder
         .forward(Some((&points, &labels)), None, None)
         .unwrap();

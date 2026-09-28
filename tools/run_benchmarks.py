@@ -18,6 +18,16 @@ parser.add_argument("--python-checkpoint", type=Path, default=ROOT / "checkpoint
 parser.add_argument("--fixture", type=Path, default=ROOT / "checkpoints/bench_bedroom.safetensors")
 parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
 parser.add_argument(
+    "--variant",
+    choices=("tiny", "small", "base-plus", "large"),
+    default="tiny",
+)
+parser.add_argument(
+    "--profile-encoder",
+    action="store_true",
+    help="diagnostic: emit synchronized matched Hiera/FPN boundaries",
+)
+parser.add_argument(
     "--cuda-graph",
     action="store_true",
     help="capture and replay the identical static CUDA inference in both implementations",
@@ -89,8 +99,11 @@ with tempfile.TemporaryDirectory(prefix="sam2-rs-bench-") as temp:
     for repeat in range(args.repeats):
         rust_out = Path(temp) / f"rust-{repeat}.f32"
         python_out = Path(temp) / f"python-{repeat}.f32"
-        rust_command = [str(binary), str(args.rust_checkpoint), str(args.fixture), str(args.iterations), str(rust_out), "--device", args.device]
-        python_command = [sys.executable, "tools/bench_static_python.py", str(args.python_checkpoint), str(args.fixture), "--iterations", str(args.iterations), "--output", str(python_out), "--device", args.device]
+        rust_command = [str(binary), str(args.rust_checkpoint), str(args.fixture), str(args.iterations), str(rust_out), "--device", args.device, "--variant", args.variant]
+        python_command = [sys.executable, "tools/bench_static_python.py", str(args.python_checkpoint), str(args.fixture), "--iterations", str(args.iterations), "--output", str(python_out), "--device", args.device, "--variant", args.variant]
+        if args.profile_encoder:
+            rust_command.append("--profile-encoder")
+            python_command.append("--profile-encoder")
         if args.threads:
             python_command.extend(["--threads", str(args.threads)])
         order = ("python", "rust") if args.alternate_order and repeat % 2 else ("rust", "python")

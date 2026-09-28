@@ -7,6 +7,7 @@
 pub mod checkpoint;
 pub mod config;
 mod cpu_allocator;
+mod cuda_allocator;
 pub mod error;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
@@ -39,7 +40,7 @@ pub use predictor::{
     BoxPrompt, ImagePrediction, ImagePredictorConfig, ImagePromptBatch, InteractiveVideoOutput,
     InteractiveVideoSession, PointPrompt, RemoveObjectOutput, Sam2AutomaticMaskGenerator,
     Sam2ImagePredictor, Sam2InteractiveVideoPredictor, Sam2MultiObjectVideoPredictor,
-    Sam2VideoPredictor, VideoFramePrediction, VideoPredictorConfig,
+    Sam2VideoPredictor, StoredVideoOutput, VideoFramePrediction, VideoPredictorConfig,
 };
 pub use transforms::{ImageGeometry, PreparedImage, Sam2ImageTransforms};
 pub use video_state::{

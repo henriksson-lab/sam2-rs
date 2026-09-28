@@ -1,0 +1,763 @@
+{
+  "images": [
+    {
+      "generated": "checkpoints/cpu-suite/bedroom.safetensors",
+      "generated_sha256": "1baf2d8ce73df1d2925cf2cca5eb065eca5295cd456d2c23ac2741e017723be2",
+      "height": 540,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "bedroom",
+      "source": "vendor/segment-anything-2/notebooks/videos/bedroom/00089.jpg",
+      "source_sha256": "81257235b7ced8eb8919a89135102a3b4cd496616d618e734b766f2b6e38faad",
+      "transform": null,
+      "width": 960
+    },
+    {
+      "generated": "checkpoints/cpu-suite/truck.safetensors",
+      "generated_sha256": "f0dc1a41be1c6d71b07f6eedf7aa53475d6b8f219ad515fd0b9839656f4a050c",
+      "height": 1200,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "truck",
+      "source": "vendor/segment-anything-2/notebooks/images/truck.jpg",
+      "source_sha256": "941715e721c8864324a1425b445ea4dde0498b995c45ddce0141a58971c6ff99",
+      "transform": null,
+      "width": 1800
+    },
+    {
+      "generated": "checkpoints/cpu-suite/groceries.safetensors",
+      "generated_sha256": "5190191b371685ddc491c4241be31744d224c50781ee634cacdafbd4566b0f32",
+      "height": 534,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "groceries",
+      "source": "vendor/segment-anything-2/notebooks/images/groceries.jpg",
+      "source_sha256": "7073dfecb5a3ecafb6152124113163a0ea1c1c70f92999ec892b519eca63e3d3",
+      "transform": null,
+      "width": 800
+    },
+    {
+      "generated": "checkpoints/cpu-suite/cars.safetensors",
+      "generated_sha256": "74075390e2709ea8f9d7e2228739e5e70d62f928b46d0f60c2f8e38560501d78",
+      "height": 1500,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "cars",
+      "source": "vendor/segment-anything-2/notebooks/images/cars.jpg",
+      "source_sha256": "76e496e8975c7f21955cbe73aaa027e541fccf5169d50744e14df780717ee52a",
+      "transform": null,
+      "width": 2250
+    },
+    {
+      "generated": "checkpoints/cpu-suite/portrait.safetensors",
+      "generated_sha256": "ec80ae8828da6d8dd5ba5fb0badc67ed3eca2713ca35f1f12713e2acc0e0c127",
+      "height": 1500,
+      "license": "Apache-2.0 (derived from SAM2 example asset)",
+      "name": "portrait",
+      "source": "vendor/segment-anything-2/notebooks/images/cars.jpg",
+      "source_sha256": "76e496e8975c7f21955cbe73aaa027e541fccf5169d50744e14df780717ee52a",
+      "transform": "crop:center:900x1500",
+      "width": 900
+    },
+    {
+      "generated": "checkpoints/cpu-suite/odd.safetensors",
+      "generated_sha256": "c9ec949bde7aa6a9eef392ac73c63906f0494f7bd9d1112c5c346cceb66e1555",
+      "height": 731,
+      "license": "Apache-2.0 (derived from SAM2 example asset)",
+      "name": "odd",
+      "source": "vendor/segment-anything-2/notebooks/images/truck.jpg",
+      "source_sha256": "941715e721c8864324a1425b445ea4dde0498b995c45ddce0141a58971c6ff99",
+      "transform": "resize:1277x731",
+      "width": 1277
+    }
+  ],
+  "schema_version": 1,
+  "spec": "benchmarks/cpu-suite.toml",
+  "spec_sha256": "7db0dfd142b31abdae44c8812062d7409439d5e4d04ac538d6c5ed0a158c3a45",
+  "videos": [
+    {
+      "encoded": "checkpoints/cpu-suite/encoded/bedroom32",
+      "frames": [
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00000.jpg",
+          "sha256": "376b034cca151817aeee7b27b581baa4aec9c9aef3807223d2deeb8dcc8d3032"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00001.jpg",
+          "sha256": "71d4ecceceeb0e53cb9d1c0332c89123946cf71cbd807e4fc6afacc244055b47"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00002.jpg",
+          "sha256": "f643d5f97fab2ee9b02d310850fb33392a3135cb7f3e997f1746c18cd8fa8b95"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00003.jpg",
+          "sha256": "0ad258da8d7f3f1ac8f6bde25f0cc78fd6c82d57bc8a7862382e4d43465463c6"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00004.jpg",
+          "sha256": "87ccc6c23c287e39e622d3ae2319d7c52e8dbad7fd16003979585461130c1e99"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00005.jpg",
+          "sha256": "e5bc58632793d2cee08b3ce3aca8e77fcb41e07306c226e44fa2ab16fbcea0db"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00006.jpg",
+          "sha256": "28d5d374ce9a72dc2995e48e8b3d783b2d1c937b188b95b33db3660e3108a586"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00007.jpg",
+          "sha256": "52715597733352744331baeb95593136f479788112f147135f0d4f26e70c355c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00008.jpg",
+          "sha256": "14288fea237adf4f68bf3c9d6a809426edcc429d8537932a1891c9250cb4a383"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00009.jpg",
+          "sha256": "1263d0323b9ff3b946291c6ae35c1911eb7ba23c8f9dad4bc168b96f2fe5d36c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00010.jpg",
+          "sha256": "c042566166ad619b56407d9bf85cb6d35833eb30805352317aa4866137aefe7e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00011.jpg",
+          "sha256": "b7c27593008a7ad549de85791ffd33955a047fd595147df6ad53faa0430a6c1b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00012.jpg",
+          "sha256": "912f76bed2ea2d718f2b20496563a87236ecb7ac059f917214ccc3f055dbfe6e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00013.jpg",
+          "sha256": "82301a9ea1960b0b76231e5f9d0330fd1cf8e32507decc53f7abc49f6d652cc5"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00014.jpg",
+          "sha256": "0ae68b7afc3588c594efdfd1047d46c57bcb44189678cbeb83d528f6ba0e2a8b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00015.jpg",
+          "sha256": "44eb3e326554c35669eb06007d2e496bf63ee62ef5e655540874774d896bf5d3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00016.jpg",
+          "sha256": "1cb5e641f361f06127fdebe0193a5e6410fcd57c1cb0d5c18ad61c60b3cd9b75"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00017.jpg",
+          "sha256": "47ab018d4233eb8d23671d6d8a7c8b974f69765b8c1317133a1d71ff25129ed2"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00018.jpg",
+          "sha256": "65ac79007dfae635f289f62e4f96b65c10dab38d01632aceb6bdcd285ec970c3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00019.jpg",
+          "sha256": "4b34fb0d6250ab6d7536a530e5b6b6c4b57afd5cdae7ece7a2389826ab13f75f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00020.jpg",
+          "sha256": "733c342af16f61793d2dc84689ac19073bc7b422fa55f1306611f2fa3ea869fb"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00021.jpg",
+          "sha256": "8a9cf2db085c621360e74d01958bca4070cbdc49dcd68780e71e98b448f1d41e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00022.jpg",
+          "sha256": "6e0ee02cd046187317402382c3149576752e5ce5b40e0ccd8312324d0b60957e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00023.jpg",
+          "sha256": "65196d4c602df2a746df0198a375152ba9c901465ff99f44098b2e850c43b0ca"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00024.jpg",
+          "sha256": "51213e148b36ef0ac501559852c3db4f743d9855c4441b62826ffd8eb6970575"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00025.jpg",
+          "sha256": "4e20cb2de520e56551aa38654fcd1080277e4385cf4bed363ebbea20c50ab415"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00026.jpg",
+          "sha256": "3db5af2f160cfd610acbfa9c4339a29b1ca3172d4316f14ad642e2b14400656e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00027.jpg",
+          "sha256": "a55cfa603e22d22e51bd4b0483079545bb12d4f13a3cf1e7a028d2945397715b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00028.jpg",
+          "sha256": "eb49fd5aad267f48b7fbee2bfcbc72e0d4388f56bee3b57055658064c5ddfa47"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00029.jpg",
+          "sha256": "34b3569178c8f76c37a38ca0d5a04ca4388855900d501555bedba2546f4cc90e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00030.jpg",
+          "sha256": "678dc520220ef780796e1179e007e45c60f57acd9de388f2f265fdff3e903382"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00031.jpg",
+          "sha256": "af8e23a4540d81fdd6f6d9ff46bc9e62428a0675bf29175205f5ae72ae5517c3"
+        }
+      ],
+      "generated": "checkpoints/cpu-suite/bedroom32.safetensors",
+      "generated_sha256": "73711dce4a75aa924076fb3f033286e8f3d082ed1887c5cc0fe3d6518e928afa",
+      "height": 540,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "bedroom32",
+      "sequence_sha256": "3a771a02e22b40f891a4f11bf2e5046a8e506d6453bcc196d499db4079482218",
+      "source": "vendor/segment-anything-2/notebooks/videos/bedroom",
+      "width": 960
+    },
+    {
+      "encoded": "checkpoints/cpu-suite/encoded/bedroom128",
+      "frames": [
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00000.jpg",
+          "sha256": "376b034cca151817aeee7b27b581baa4aec9c9aef3807223d2deeb8dcc8d3032"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00001.jpg",
+          "sha256": "71d4ecceceeb0e53cb9d1c0332c89123946cf71cbd807e4fc6afacc244055b47"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00002.jpg",
+          "sha256": "f643d5f97fab2ee9b02d310850fb33392a3135cb7f3e997f1746c18cd8fa8b95"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00003.jpg",
+          "sha256": "0ad258da8d7f3f1ac8f6bde25f0cc78fd6c82d57bc8a7862382e4d43465463c6"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00004.jpg",
+          "sha256": "87ccc6c23c287e39e622d3ae2319d7c52e8dbad7fd16003979585461130c1e99"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00005.jpg",
+          "sha256": "e5bc58632793d2cee08b3ce3aca8e77fcb41e07306c226e44fa2ab16fbcea0db"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00006.jpg",
+          "sha256": "28d5d374ce9a72dc2995e48e8b3d783b2d1c937b188b95b33db3660e3108a586"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00007.jpg",
+          "sha256": "52715597733352744331baeb95593136f479788112f147135f0d4f26e70c355c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00008.jpg",
+          "sha256": "14288fea237adf4f68bf3c9d6a809426edcc429d8537932a1891c9250cb4a383"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00009.jpg",
+          "sha256": "1263d0323b9ff3b946291c6ae35c1911eb7ba23c8f9dad4bc168b96f2fe5d36c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00010.jpg",
+          "sha256": "c042566166ad619b56407d9bf85cb6d35833eb30805352317aa4866137aefe7e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00011.jpg",
+          "sha256": "b7c27593008a7ad549de85791ffd33955a047fd595147df6ad53faa0430a6c1b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00012.jpg",
+          "sha256": "912f76bed2ea2d718f2b20496563a87236ecb7ac059f917214ccc3f055dbfe6e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00013.jpg",
+          "sha256": "82301a9ea1960b0b76231e5f9d0330fd1cf8e32507decc53f7abc49f6d652cc5"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00014.jpg",
+          "sha256": "0ae68b7afc3588c594efdfd1047d46c57bcb44189678cbeb83d528f6ba0e2a8b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00015.jpg",
+          "sha256": "44eb3e326554c35669eb06007d2e496bf63ee62ef5e655540874774d896bf5d3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00016.jpg",
+          "sha256": "1cb5e641f361f06127fdebe0193a5e6410fcd57c1cb0d5c18ad61c60b3cd9b75"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00017.jpg",
+          "sha256": "47ab018d4233eb8d23671d6d8a7c8b974f69765b8c1317133a1d71ff25129ed2"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00018.jpg",
+          "sha256": "65ac79007dfae635f289f62e4f96b65c10dab38d01632aceb6bdcd285ec970c3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00019.jpg",
+          "sha256": "4b34fb0d6250ab6d7536a530e5b6b6c4b57afd5cdae7ece7a2389826ab13f75f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00020.jpg",
+          "sha256": "733c342af16f61793d2dc84689ac19073bc7b422fa55f1306611f2fa3ea869fb"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00021.jpg",
+          "sha256": "8a9cf2db085c621360e74d01958bca4070cbdc49dcd68780e71e98b448f1d41e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00022.jpg",
+          "sha256": "6e0ee02cd046187317402382c3149576752e5ce5b40e0ccd8312324d0b60957e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00023.jpg",
+          "sha256": "65196d4c602df2a746df0198a375152ba9c901465ff99f44098b2e850c43b0ca"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00024.jpg",
+          "sha256": "51213e148b36ef0ac501559852c3db4f743d9855c4441b62826ffd8eb6970575"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00025.jpg",
+          "sha256": "4e20cb2de520e56551aa38654fcd1080277e4385cf4bed363ebbea20c50ab415"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00026.jpg",
+          "sha256": "3db5af2f160cfd610acbfa9c4339a29b1ca3172d4316f14ad642e2b14400656e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00027.jpg",
+          "sha256": "a55cfa603e22d22e51bd4b0483079545bb12d4f13a3cf1e7a028d2945397715b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00028.jpg",
+          "sha256": "eb49fd5aad267f48b7fbee2bfcbc72e0d4388f56bee3b57055658064c5ddfa47"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00029.jpg",
+          "sha256": "34b3569178c8f76c37a38ca0d5a04ca4388855900d501555bedba2546f4cc90e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00030.jpg",
+          "sha256": "678dc520220ef780796e1179e007e45c60f57acd9de388f2f265fdff3e903382"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00031.jpg",
+          "sha256": "af8e23a4540d81fdd6f6d9ff46bc9e62428a0675bf29175205f5ae72ae5517c3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00032.jpg",
+          "sha256": "98306360dd1461aefe7db1ef125b8bb757f2cacc2cd65912a57af431701d1642"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00033.jpg",
+          "sha256": "b7b5fb29c492c886911ad255381d65cb43a2cafa9bac36ceac1122460655ad76"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00034.jpg",
+          "sha256": "b6cf0ef01409f5a24b9c6e29dc2a6e0a09bf7a1f8436593ac7b4d037de61271f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00035.jpg",
+          "sha256": "66baa037be80d4f4e052ad2e8e8d7fa282a6fd5c2f2e5ddf1de9a013b66dd0bc"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00036.jpg",
+          "sha256": "862fc116741c859c3d15011c23866ba6edbefd1fc908e3434a280b86d56841fd"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00037.jpg",
+          "sha256": "845b1251d2b35763a0118c8933047d7b4459c86f930b19983b7eb39a7270c673"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00038.jpg",
+          "sha256": "05f159e078bacf18c1945610c13d298be0a566afb5cf1c234cdaaa3d8ad3a4a3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00039.jpg",
+          "sha256": "86e78b8b39f5dd1794e050990ff80d5ccd432098c83ac3cf2d41a171f5a1ca47"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00040.jpg",
+          "sha256": "1891992a3cffb9095142d157e090fad7d63f9ba4d6a9c9e2ae49aa897454102e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00041.jpg",
+          "sha256": "e3f4f78fffe3f80a2f8bd112024d15bb4901fc32f4747e88292e54135a77b12c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00042.jpg",
+          "sha256": "05c8f9a255d24557c8840e411b467cdea902beb1d0519f1225ca8e7672f5dcae"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00043.jpg",
+          "sha256": "0dda0e60cfd60d0df2f3653713eab620f2c673af8ed3aea4225387856d91b54a"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00044.jpg",
+          "sha256": "d5d7d6d5464ab6579eee48d48e95e7a531bbf6efb9ed801bd5f0cdef7ab1c165"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00045.jpg",
+          "sha256": "2303a4794efeedf0e8a11a25159bb32ec251db5f82ea1ac834395c1d5dd1d76d"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00046.jpg",
+          "sha256": "a15b162a0769992cba310e4fd40dfa6d4a8ecbf7d28dff9e53b46dce451ac8bd"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00047.jpg",
+          "sha256": "9cf5a26b8230155a340eba37a597d35d381a15285eb602b62a0ec46f25912523"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00048.jpg",
+          "sha256": "77f398ed92d903e9795aba8fb53127f2ea86025269f51fd63f64e0fbd1aafa60"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00049.jpg",
+          "sha256": "3e86ae96b7e7b9b23f7711a4fdda31c7dc49ba1395da4ff2793601d6dffd0161"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00050.jpg",
+          "sha256": "bf3ac9acbec6b0ea027123a6e1e605ad2f416f49cb8ca073729c59dedf48986f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00051.jpg",
+          "sha256": "27946b26fd994653461b3036570c66e10534ed7a7baf0761d9de7464aa6d75ed"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00052.jpg",
+          "sha256": "d6730e3a1a47940d80b6f62afbd95867b793d8c021dc1f9e4963754bac353981"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00053.jpg",
+          "sha256": "9882d1fe3381bd21522b08a16af0afe7d2231f83f353f1eed9cc6fd70913e690"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00054.jpg",
+          "sha256": "0973e9caec29b9fc0accf7072d981139834c9bec67d8b9b1658b96cb1f56e83f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00055.jpg",
+          "sha256": "195148443f3e77ca096594892c6276cc8039a22228357054df68afb2a6bd3b6f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00056.jpg",
+          "sha256": "701474856624d686ced7b007c2f4eccc5f3258f268fab65e6d65fb42b8bb5ee8"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00057.jpg",
+          "sha256": "a3466a221f698ecf2c518557fcbe785e9b604ba6bbb701f6b8d308d02630933a"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00058.jpg",
+          "sha256": "c21ecbd9d8aa6348d368ad54faf28870eb1d9a84af423ec1e8ec1164e27af035"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00059.jpg",
+          "sha256": "9449d69c25fd6a469549b9efc96ceb9b2a23f09267605b52679eeabfea61790e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00060.jpg",
+          "sha256": "6a7210b3f6943a949485e143b8157b02dce35c9609fdc4170c54fc13b4ee3c78"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00061.jpg",
+          "sha256": "8146d007b537384ac32c53136eb122f891a08bd70c56409965671bdddbbf4d0c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00062.jpg",
+          "sha256": "d27f23f7b0bbe43f20b167e7127a96ab352acd9498857911f6ac9d9f97c76610"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00063.jpg",
+          "sha256": "dcead8b6a4a9d5a7eb3d4f969455dc012ec339acf66533cf218f375965a190a3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00064.jpg",
+          "sha256": "568718cf5c8a604cfcbad90775bc540d45a2688552701f85e8e2e61ffd47fa2e"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00065.jpg",
+          "sha256": "110d258365fe6bfc11b136ec0ba94ea53b8558b5a18200eb4b74f868fc45257f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00066.jpg",
+          "sha256": "502ab40712ba49ac4ac2e03c96f90ab2f7ed413ee83de25fed377b41bae2bae3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00067.jpg",
+          "sha256": "3f6e986f5e237df0229831aa022dbbe1e4e125c08fa42d32a7a1e9db3366c0df"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00068.jpg",
+          "sha256": "2d305c3aff0be03f27c13ba65c807f8be72bc4f92d0c2a806d5f6078a3a0c06b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00069.jpg",
+          "sha256": "414a9a4a4367cdfe21e9614bff650738f31b8bf0f70725beb70f455ff4a21a01"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00070.jpg",
+          "sha256": "94364724fd9927d2bc242f3003af63d649a26f10db3f0d62c573f0a8063fd528"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00071.jpg",
+          "sha256": "c56dfc4e4c0ab18f765fe865fd352c66914b6ef4792573405d2479ab286f62e0"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00072.jpg",
+          "sha256": "9d3b9110d5b177adab9cfd242a497480964ca4002e0511f9d9238ac9581a2e9d"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00073.jpg",
+          "sha256": "fab89cb3d5876b4e2a812bf1ca5389233081dfafc7ad018264fd48a95eb46830"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00074.jpg",
+          "sha256": "4564d87661a77514586e79ef4d9d0311e19e766219428bcf068d6655fbd3859a"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00075.jpg",
+          "sha256": "4b40c88251e8f4b3fe14215e0aa54327f78c8de5a76e9146da94a2c1b305bef1"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00076.jpg",
+          "sha256": "841e0602171daeb1ccc9872624b6c12811082fc2cbbaeb9ecb9551dea8323676"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00077.jpg",
+          "sha256": "d2093393ea87788bf12c65b0a4b9ca20f21db848e31ba04f20758619391785e2"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00078.jpg",
+          "sha256": "4cc0169ca005ed72721007fdffae373395e78bf01994b87e074fc5cfab831601"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00079.jpg",
+          "sha256": "754e21a884ccd7c79d6b13bd6c687790057f6ba93eaa07a9865377f5735f4a09"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00080.jpg",
+          "sha256": "19291db18f58a51291a810fb3fb329ef274f668efb5f5ec1e0a2d03d461e45ec"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00081.jpg",
+          "sha256": "adacda29500b04cdc46cdb02b24e4a26c37e496e4148f2a265668bb984acf1a0"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00082.jpg",
+          "sha256": "764087d02a99500da1840357113d90aade13baff7f391540ef98d49fa26c5c1c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00083.jpg",
+          "sha256": "4f8a2a3dec8c2fbdab57a2b4c6d0dcdd9885f51ab1b52d67703c785b06cc2fd4"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00084.jpg",
+          "sha256": "13af3fc513704c1df9aa19c4e0fc9ba6947c319275b422117c0d4f528fa64440"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00085.jpg",
+          "sha256": "088d52dea0532177046aa7c744782eba6f06f8bc847145b5ef502d82902f7a2c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00086.jpg",
+          "sha256": "b88729b4f0db21d7a801a0b04ea0efc59408a117bd658ef4720111e633c805c2"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00087.jpg",
+          "sha256": "3e441c0ed79fd08bedc9ee48423fb1a57abe8f7ca13af39a13b932a622f67bf9"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00088.jpg",
+          "sha256": "16bec019a65f65f6975ed79160ecb7271464bf446476671b631741438ef12516"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00089.jpg",
+          "sha256": "81257235b7ced8eb8919a89135102a3b4cd496616d618e734b766f2b6e38faad"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00090.jpg",
+          "sha256": "99479c7dc05d5865afb089c229b1b7ac7236ab79951340b3387232d0ed55fda3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00091.jpg",
+          "sha256": "1d31c7e6faf3760982b442f58f83a40c37b59a7ac1cfea2d9f36ba0b7a503c8b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00092.jpg",
+          "sha256": "5673fd40d29f84009c679f33939d84ce17bdfc69877466dbb45a15c3a58e97bb"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00093.jpg",
+          "sha256": "62af577237d49b69dd800f8899a86638f23391a11ec6dc4a9989c8a9ca4c27ac"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00094.jpg",
+          "sha256": "db9292e46200b4bd9481866e70aa200a1d01b3dee7fd6c99cafa05e8908fdd30"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00095.jpg",
+          "sha256": "0ad7e1fb3e92251f46dfb8d425a77b5e13ce6d6e272cd63f2cae3ee8f82ee391"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00096.jpg",
+          "sha256": "ea90ac1665387d110d14e14b4ec8aa270e532d81b3ae701166f43d2d9bb9cc55"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00097.jpg",
+          "sha256": "d50f6eb0676515077842a34ee28bf03251e3929d3eed6931e92f13c2a59492d3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00098.jpg",
+          "sha256": "c39029ac62d814e70271581a7e8f0b204c5813726d9a19be22c08e39665a1b0c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00099.jpg",
+          "sha256": "bba652efaab54007330a29bfedc159d19d90574b14d711e2e276ddd1c2dd305f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00100.jpg",
+          "sha256": "03f6b67e53839e26c9e71cfaab35510c6ce9ffe49e5196a3d932eea0c141d6a8"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00101.jpg",
+          "sha256": "9af83d555c2e3883d947d2d2f7be37ff3b70ce7de713712681180cd0fec70760"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00102.jpg",
+          "sha256": "3ff2f263bbcd64598e3ac02e92cc5ca3ced05b9929c9f217657005fe04033e38"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00103.jpg",
+          "sha256": "f3c6c1caace76a16ddb4a0d2be5e2a0638a0c004b8deb0dae2f0e1b5b5f81246"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00104.jpg",
+          "sha256": "063b7fcb8b08d72fc341eaef8ae502aa4935894d55827ff9b3967a1ddb4f19e5"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00105.jpg",
+          "sha256": "6e47dec62a0529177896aa47483c24cbb18bb3e5d2a37dac3a5152cfb2d34792"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00106.jpg",
+          "sha256": "508bd87ab1366d8531d7086dc41c2169c7abebbfdfcccf7d03a2f144825a4c14"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00107.jpg",
+          "sha256": "b788e504f568244ccb51ca58681c162cda0d9f56eefe6feb08e66b592b15cc1c"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00108.jpg",
+          "sha256": "223d4895b17acc7e1dc374cfbff6c6ba29a625918b4b30cb5221a7d5ed9ee6ad"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00109.jpg",
+          "sha256": "1ff8a5517aadf755299c1a8b9fb65603daecc1e3184766b62acacac59788cecf"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00110.jpg",
+          "sha256": "1ef0a1489d853a0240da58fc8eaa38408b0d3cbf731e7736fca4e1795fa49558"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00111.jpg",
+          "sha256": "e45cbd42679fe1423134584841d6004cc5777b88e68b7e70c4a2c8d3aa33766d"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00112.jpg",
+          "sha256": "c34aa12b85b9d026c031f8b597b8c519242fe922692d2b92d83ae6c5a6ff7188"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00113.jpg",
+          "sha256": "79dfb1c9021d0ad0906f02291ebb37b355afd19f7437e94934b274c92458b228"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00114.jpg",
+          "sha256": "c952d22f4bd48eed9182a42a0297ea684393a18b0fbba24202831a481fac50b8"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00115.jpg",
+          "sha256": "aaca373fbb7641d4efea1f979dea19e1075d33873f6f60dd60efc292ec006a32"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00116.jpg",
+          "sha256": "b452febcb7d6848129c9596c7343db7a2ac023108a8004aee47376e03ad9454b"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00117.jpg",
+          "sha256": "3042f5b322c5a1b5320fde2ecac1e7bd01f7ed1000ca06239878756dd9d6f9d3"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00118.jpg",
+          "sha256": "840cc0c0c673070895619b751018f27c37da6a76e9e24f46dc2b0a94d207c926"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00119.jpg",
+          "sha256": "c08f34b6b4446a43e467cea65db31cde96412a458e4c7944c635b284baa5948f"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00120.jpg",
+          "sha256": "e093d64e7d558e78ad4e24d6e768672d93f560b3bf4357e19f9857b54aec0337"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00121.jpg",
+          "sha256": "43451592a938074d7f769c5d6f5213fbd4f1670f13d8b1ec239678990d436c13"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00122.jpg",
+          "sha256": "3600462dc4b842729636df443e06cfa556e10e582d75fd0cb9e7e5b13a0ce185"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00123.jpg",
+          "sha256": "a6622eacda2e9560fa32849e7facefb1da771ad7ad654fea1fd202f782a4b524"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00124.jpg",
+          "sha256": "7a0d642fb5c3ed2f5f200d8016a64610b3342688e6bc90874e162268d62b0c18"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00125.jpg",
+          "sha256": "e36570bf02c411f5fb9b522b212a8b07344f955f9711ede1563bbc1a79b63720"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00126.jpg",
+          "sha256": "f7308245a125ebca957d7951031c0df0e6e57f1196270aba93792b8c0f3c2fd7"
+        },
+        {
+          "path": "vendor/segment-anything-2/notebooks/videos/bedroom/00127.jpg",
+          "sha256": "78fab1382dcd278fd4f4aba94c00353491e5e3c9618d830f28be2b994e945a24"
+        }
+      ],
+      "generated": "checkpoints/cpu-suite/bedroom128.safetensors",
+      "generated_sha256": "38dc3ae31f20dc7325666ea07561adfe55f3e358adfbd8c3759db08bc69a08f3",
+      "height": 540,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "bedroom128",
+      "sequence_sha256": "73a16dc965045a3fa856a8d180ce4ad2b5619f36166419b734a184d4b59ba293",
+      "source": "vendor/segment-anything-2/notebooks/videos/bedroom",
+      "width": 960
+    },
+    {
+      "encoded": "checkpoints/cpu-suite/encoded/bedroom_mp4.mp4",
+      "encoded_sha256": "d1b9b2e96f4128dc7afc08914485d5fe9dd9ef274f81806597378b3edabcb383",
+      "frames": 32,
+      "license": "Apache-2.0 (SAM2 example asset)",
+      "name": "bedroom_mp4",
+      "source": "vendor/segment-anything-2/notebooks/videos/bedroom.mp4",
+      "source_sha256": "1be76d5d19b066e8ad7c565d88a98e11a8f8d456a707508a7aa35390def70e30",
+      "start": 0,
+      "stride": 1
+    },
+    {
+      "encoded": "checkpoints/cpu-suite/encoded/juggle_mp4.mp4",
+      "encoded_sha256": "d030bda3ebccf33915976a45f0e565a67cee2be3f2cbe4901c1316e1c01d9529",
+      "frames": 32,
+      "license": "Apache-2.0 (SAM2 demo gallery asset)",
+      "name": "juggle_mp4",
+      "source": "vendor/segment-anything-2/demo/data/gallery/05_default_juggle.mp4",
+      "source_sha256": "60d23773ad50389a5c2df9ba4ab05e9b4d39d21dfa7b75d15b46666ff7a4e2bb",
+      "start": 0,
+      "stride": 4
+    }
+  ]
+}

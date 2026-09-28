@@ -15,6 +15,7 @@ parser.add_argument("fixture", type=Path)
 parser.add_argument("--iterations", type=int, default=3)
 parser.add_argument("--output", type=Path)
 parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+parser.add_argument("--variant", choices=("tiny", "small", "base-plus", "large"), default="tiny")
 parser.add_argument("--profile-stages", action="store_true")
 parser.add_argument("--profile-encoder", action="store_true", help="emit synchronized Hiera block and FPN timings")
 parser.add_argument("--profile-decoder", action="store_true", help="emit synchronized mask-decoder phase timings")
@@ -44,8 +45,21 @@ if args.disable_mkldnn:
 fixture = load_file(str(args.fixture))
 if args.device == "cuda" and not torch.cuda.is_available():
     raise RuntimeError("--device cuda requested but PyTorch cannot access a CUDA device")
-model = build_sam2("configs/sam2.1/sam2.1_hiera_t.yaml", str(args.checkpoint), device=args.device, apply_postprocessing=False)
+variant_configs = {
+    "tiny": "configs/sam2.1/sam2.1_hiera_t.yaml",
+    "small": "configs/sam2.1/sam2.1_hiera_s.yaml",
+    "base-plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+    "large": "configs/sam2.1/sam2.1_hiera_l.yaml",
+}
+model = build_sam2(variant_configs[args.variant], str(args.checkpoint), device=args.device, apply_postprocessing=True)
 image, points, labels = (fixture["image"].to(args.device), fixture["points"].to(args.device), fixture["labels"].to(args.device))
+
+def forward_image():
+    """Match SAM2ImagePredictor.set_image, including the no-memory embedding."""
+    image_output = model.forward_image(image)
+    if model.directly_add_no_mem_embed:
+        image_output["vision_features"] = image_output["vision_features"] + model.no_mem_embed.reshape(1, -1, 1, 1)
+    return image_output
 
 def decode(image_output):
     sparse, dense = model.sam_prompt_encoder((points, labels), None, None)
@@ -53,7 +67,7 @@ def decode(image_output):
     return masks
 
 def infer():
-    return decode(model.forward_image(image))
+    return decode(forward_image())
 
 def synchronize():
     if args.device == "cuda":
@@ -132,7 +146,7 @@ def profile_image_encoder():
     handles.append(model.image_encoder.neck.register_forward_pre_hook(neck_pre))
     handles.append(model.image_encoder.neck.register_forward_hook(neck_post))
     try:
-        output = model.forward_image(image)
+        output = forward_image()
         synchronize()
     finally:
         for handle in handles:
@@ -251,7 +265,7 @@ def profile_mask_decoder(image_output):
 
 with torch.inference_mode():
     infer()
-    cached_image_output = model.forward_image(image) if args.decoder_only else None
+    cached_image_output = forward_image() if args.decoder_only else None
     if args.device == "cuda":
         torch.cuda.synchronize()
     cuda_graph = None
@@ -292,7 +306,7 @@ with torch.inference_mode():
             elif args.decoder_only:
                 image_output = cached_image_output
             else:
-                image_output = model.forward_image(image)
+                image_output = forward_image()
             if args.device == "cuda":
                 torch.cuda.synchronize()
             encoder_ms = (time.perf_counter() - start) * 1000

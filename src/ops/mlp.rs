@@ -149,7 +149,11 @@ impl Mlp {
                 },
             ));
         }
-        let fuse_gelu = self.activation == Activation::Gelu
+        // The specialized implementation fuses exact GELU only on CPU. On
+        // CUDA it deliberately falls back to fused-bias Linear followed by a
+        // separate GELU kernel, so keep those phases separate in diagnostics.
+        let fuse_gelu = x.device().is_cpu()
+            && self.activation == Activation::Gelu
             && std::env::var_os("CANDLE_CPU_LINEAR_GELU_FUSION").is_none_or(|value| value != "0");
         let start = Instant::now();
         let expanded = if fuse_gelu {

@@ -1,6 +1,8 @@
 //! Translation of `sam2/modeling/memory_encoder.py`.
 
-use candle_core::{Result, Tensor};
+use std::time::Instant;
+
+use candle_core::{DType, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder, conv2d, linear, ops::sigmoid};
 
 use crate::ops::{LayerNorm2d, PositionEmbeddingSine};
@@ -55,10 +57,31 @@ struct CxBlock {
     norm: LayerNorm2d,
     pwconv1: candle_nn::Linear,
     pwconv2: candle_nn::Linear,
+    pwconv1_cpu: Conv2d,
+    pwconv2_cpu: Conv2d,
     gamma: Tensor,
+    gamma_nchw: Tensor,
 }
 impl CxBlock {
     fn load(vb: VarBuilder) -> Result<Self> {
+        let pwconv1 = linear(256, 1024, vb.pp("pwconv1"))?;
+        let pwconv2 = linear(1024, 256, vb.pp("pwconv2"))?;
+        // A pointwise Linear over NHWC and a 1x1 convolution over NCHW are
+        // mathematically identical. Keep shallow reshaped handles to the same
+        // checkpoint storage so CPU inference can stay NCHW and feed one GEMM
+        // without materializing the 4 MiB activation in NHWC order.
+        let pwconv1_cpu = Conv2d::new(
+            pwconv1.weight().reshape((1024, 256, 1, 1))?,
+            pwconv1.bias().cloned(),
+            Conv2dConfig::default(),
+        );
+        let pwconv2_cpu = Conv2d::new(
+            pwconv2.weight().reshape((256, 1024, 1, 1))?,
+            pwconv2.bias().cloned(),
+            Conv2dConfig::default(),
+        );
+        let gamma = vb.get(256, "gamma")?;
+        let gamma_nchw = gamma.reshape((1, 256, 1, 1))?;
         Ok(Self {
             dwconv: conv2d(
                 256,
@@ -72,21 +95,77 @@ impl CxBlock {
                 vb.pp("dwconv"),
             )?,
             norm: LayerNorm2d::load(256, 1e-6, vb.pp("norm"))?,
-            pwconv1: linear(256, 1024, vb.pp("pwconv1"))?,
-            pwconv2: linear(1024, 256, vb.pp("pwconv2"))?,
-            gamma: vb.get(256, "gamma")?,
+            pwconv1,
+            pwconv2,
+            pwconv1_cpu,
+            pwconv2_cpu,
+            gamma,
+            gamma_nchw,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let profiling = std::env::var_os("SAM2_PROFILE_VIDEO_STAGES").is_some();
+        if profiling {
+            x.device().synchronize()?;
+        }
+        let mut profile_start = Instant::now();
+        macro_rules! profile_stage {
+            ($name:expr) => {
+                if profiling {
+                    x.device().synchronize()?;
+                    eprintln!(
+                        "SAM2_MEMORY_FUSER_STAGE stage={} ms={:.6}",
+                        $name,
+                        profile_start.elapsed().as_secs_f64() * 1000.
+                    );
+                    profile_start = Instant::now();
+                }
+            };
+        }
         let input = x.clone();
-        let x = self
-            .norm
-            .forward(&self.dwconv.forward(x)?)?
-            .permute((0, 2, 3, 1))?;
-        let x = self
-            .pwconv2
-            .forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
-        input.broadcast_add(&x.broadcast_mul(&self.gamma)?.permute((0, 3, 1, 2))?)
+        let x = self.dwconv.forward(x)?;
+        profile_stage!("depthwise_conv");
+        let x = self.norm.forward(&x)?;
+        profile_stage!("layer_norm_2d");
+        if x.device().is_cpu()
+            && x.dtype() == DType::F32
+            && std::env::var_os("SAM2_CPU_MEMORY_FUSER_NCHW_POINTWISE")
+                .is_none_or(|value| value != "0")
+        {
+            let x = self.pwconv1_cpu.forward_fused_bias_cpu(&x)?;
+            profile_stage!("pointwise_1");
+            let x = x.gelu_erf()?;
+            profile_stage!("gelu");
+            let x = self.pwconv2_cpu.forward_fused_bias_cpu(&x)?;
+            profile_stage!("pointwise_2");
+            let x = x.broadcast_mul(&self.gamma_nchw)?;
+            let output = input.broadcast_add(&x)?;
+            if profiling {
+                x.device().synchronize()?;
+                eprintln!(
+                    "SAM2_MEMORY_FUSER_STAGE stage=scale_and_residual ms={:.6}",
+                    profile_start.elapsed().as_secs_f64() * 1000.
+                );
+            }
+            return Ok(output);
+        }
+        let x = x.permute((0, 2, 3, 1))?;
+        let x = self.pwconv1.forward(&x)?;
+        profile_stage!("pointwise_1");
+        let x = x.gelu_erf()?;
+        profile_stage!("gelu");
+        let x = self.pwconv2.forward(&x)?;
+        profile_stage!("pointwise_2");
+        let x = x.broadcast_mul(&self.gamma)?.permute((0, 3, 1, 2))?;
+        let output = input.broadcast_add(&x)?;
+        if profiling {
+            x.device().synchronize()?;
+            eprintln!(
+                "SAM2_MEMORY_FUSER_STAGE stage=scale_and_residual ms={:.6}",
+                profile_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        Ok(output)
     }
 }
 
@@ -102,10 +181,17 @@ pub struct MemoryEncoder {
     pix_feat_proj: Conv2d,
     fuser: [CxBlock; 2],
     position_encoding: PositionEmbeddingSine,
+    cached_position_encoding: Tensor,
     out_proj: Conv2d,
 }
 impl MemoryEncoder {
     pub fn load(vb: VarBuilder) -> Result<Self> {
+        let position_encoding = PositionEmbeddingSine::new(64, 10_000., true, None);
+        // SAM2's memory encoder always emits 64x64 features for its fixed
+        // 1024px model input. The sine encoding is immutable and identical on
+        // every frame, so retain one shallow-cloned device tensor instead of
+        // rebuilding its coordinate grids and trigonometric intermediates.
+        let cached_position_encoding = position_encoding.pe(1, 64, 64, vb.device())?;
         Ok(Self {
             mask_downsampler: MaskDownsampler::load(vb.pp("mask_downsampler"))?,
             pix_feat_proj: conv2d(256, 256, 1, Conv2dConfig::default(), vb.pp("pix_feat_proj"))?,
@@ -113,7 +199,8 @@ impl MemoryEncoder {
                 CxBlock::load(vb.pp("fuser.layers.0"))?,
                 CxBlock::load(vb.pp("fuser.layers.1"))?,
             ],
-            position_encoding: PositionEmbeddingSine::new(64, 10_000., true, None),
+            position_encoding,
+            cached_position_encoding,
             out_proj: conv2d(256, 64, 1, Conv2dConfig::default(), vb.pp("out_proj"))?,
         })
     }
@@ -123,24 +210,56 @@ impl MemoryEncoder {
         masks: &Tensor,
         skip_mask_sigmoid: bool,
     ) -> Result<MemoryEncoderOutput> {
+        let profiling = std::env::var_os("SAM2_PROFILE_VIDEO_STAGES").is_some();
+        if profiling {
+            pix_feat.device().synchronize()?;
+        }
+        let mut profile_start = Instant::now();
+        macro_rules! profile_stage {
+            ($name:expr) => {
+                if profiling {
+                    pix_feat.device().synchronize()?;
+                    eprintln!(
+                        "SAM2_MEMORY_ENCODER_STAGE stage={} ms={:.6}",
+                        $name,
+                        profile_start.elapsed().as_secs_f64() * 1000.
+                    );
+                    profile_start = Instant::now();
+                }
+            };
+        }
         let masks = if skip_mask_sigmoid {
             masks.clone()
         } else {
             sigmoid(masks)?
         };
         let masks = self.mask_downsampler.forward(&masks)?;
+        profile_stage!("mask_downsampler");
         let mut x = self
             .pix_feat_proj
             .forward(pix_feat)?
             .broadcast_add(&masks)?;
-        for layer in &self.fuser {
+        profile_stage!("pixel_projection");
+        for (index, layer) in self.fuser.iter().enumerate() {
             x = layer.forward(&x)?;
+            profile_stage!(if index == 0 { "fuser_0" } else { "fuser_1" });
         }
         let features = self.out_proj.forward(&x)?;
-        let pos = self
-            .position_encoding
-            .forward(&features)?
-            .to_dtype(features.dtype())?;
+        profile_stage!("output_projection");
+        let batch = features.dim(0)?;
+        let pos = if batch == 1 && features.dims()[2..] == [64, 64] {
+            self.cached_position_encoding.clone()
+        } else {
+            self.position_encoding.forward(&features)?
+        }
+        .to_dtype(features.dtype())?;
+        if profiling {
+            pix_feat.device().synchronize()?;
+            eprintln!(
+                "SAM2_MEMORY_ENCODER_STAGE stage=position_encoding ms={:.6}",
+                profile_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
         Ok(MemoryEncoderOutput {
             vision_features: features,
             vision_pos_enc: pos,

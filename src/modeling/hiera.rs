@@ -42,7 +42,7 @@ struct MultiScaleAttentionProfile {
     cleanup_qkv_ms: f64,
 }
 
-fn math_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+pub(crate) fn math_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if q.device().is_cuda()
         && k.dims() == v.dims()
@@ -354,7 +354,11 @@ impl MultiScaleAttention {
         let head_dim = self.dim_out / self.num_heads;
         #[cfg(feature = "cpu-flash-attention")]
         if q.device().is_cpu() && q.dim(1)? >= 512 {
-            let attended = flash_attn_nhsd_f32(&q, &k, &v, 1. / (head_dim as f32).sqrt())?;
+            let attended = if batch == 1 {
+                flash_attn_nhsd_f32(&q, &k, &v, 1. / (head_dim as f32).sqrt())?
+            } else {
+                flash_attn_nhsd_f32_batched(&q, &k, &v, 1. / (head_dim as f32).sqrt())?
+            };
             return self.proj.forward_fused_bias_cpu(&attended.reshape((
                 batch,
                 height,
@@ -435,12 +439,12 @@ impl MultiScaleAttention {
         #[cfg(feature = "cpu-flash-attention")]
         let attended =
             if q.device().is_cpu() && q.dim(1)? >= 512 {
-                flash_attn_nhsd_f32(&q, &k, &v, 1. / (head_dim as f32).sqrt())?.reshape((
-                    batch,
-                    height,
-                    width,
-                    self.dim_out,
-                ))?
+                (if batch == 1 {
+                    flash_attn_nhsd_f32(&q, &k, &v, 1. / (head_dim as f32).sqrt())
+                } else {
+                    flash_attn_nhsd_f32_batched(&q, &k, &v, 1. / (head_dim as f32).sqrt())
+                })?
+                .reshape((batch, height, width, self.dim_out))?
             } else if q.device().is_cpu() && batch > 1 {
                 flash_attn_nhsd_f32_batched(&q, &k, &v, 1. / (head_dim as f32).sqrt())?
                     .reshape((batch, height, width, self.dim_out))?
@@ -906,8 +910,17 @@ impl Hiera {
     }
 
     fn position_embedding(&self, height: usize, width: usize) -> Result<Tensor> {
-        let use_cache =
-            std::env::var_os("SAM2_STATIC_POSITION_CACHE").is_some_and(|value| value == "1");
+        // Image preprocessing maps every ordinary SAM2 input to the model's
+        // fixed encoder shape. Retain one immutable positional tensor on CUDA
+        // so repeated images do not rebuild its bicubic resize and tiled
+        // window embedding. The cache is a single shared tensor handle (not a
+        // per-thread copy), remains shape-checked, and never grows. CPU keeps
+        // the measured uncached default; 1/0 explicitly enables/disables it.
+        let use_cache = match std::env::var_os("SAM2_STATIC_POSITION_CACHE") {
+            Some(value) if value == "1" => true,
+            Some(value) if value == "0" => false,
+            _ => self.pos_embed.device().is_cuda(),
+        };
         if use_cache {
             let cache = self.position_cache.lock().map_err(|_| {
                 candle_core::Error::Msg("Hiera position cache mutex poisoned".into())

@@ -1,6 +1,6 @@
 //! Temporal SAM2 base model for native single-object video/z-slice inference.
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, Module, conv2d, linear, ops::sigmoid};
@@ -71,6 +71,7 @@ impl Sam2Base {
         if device.is_cpu() {
             crate::cpu_allocator::configure_cpu_allocator_for_inference();
         }
+        crate::cuda_allocator::configure_cuda_allocator_for_inference(device)?;
         let config = Sam2Config::sam2_1(variant);
         crate::checkpoint::validate_sam2_1(path.as_ref(), variant)?;
         let vb = crate::checkpoint::load_var_builder(path, DType::F32, device)?;
@@ -228,9 +229,135 @@ impl Sam2Base {
         reverse: bool,
         num_frames: Option<usize>,
     ) -> Result<Sam2FrameOutput> {
+        self.track_backbone_with_mask_prompt_impl(
+            backbone,
+            frame_index,
+            is_conditioning,
+            state,
+            points,
+            bounding_box,
+            mask_input,
+            binarize_mask_for_memory,
+            multimask_output,
+            reverse,
+            num_frames,
+            true,
+            false,
+        )
+    }
+
+    /// Runs a video-predictor tracking step and stores temporal features in
+    /// the compact BF16 format used by upstream `SAM2VideoPredictor`, on CPU
+    /// as well as CUDA. The public low-level model API intentionally retains
+    /// its native compute dtype instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn track_backbone_with_compact_memory(
+        &self,
+        backbone: &BackboneOutput,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        binarize_mask_for_memory: bool,
+        multimask_output: bool,
+        reverse: bool,
+        num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
+        self.track_backbone_with_mask_prompt_impl(
+            backbone,
+            frame_index,
+            is_conditioning,
+            state,
+            points,
+            bounding_box,
+            mask_input,
+            binarize_mask_for_memory,
+            multimask_output,
+            reverse,
+            num_frames,
+            true,
+            true,
+        )
+    }
+
+    /// Runs the interactive decoder without encoding temporal memory. The
+    /// upstream video predictor defers that work until propagation preflight,
+    /// after all object masks can be consolidated. Memory fields in the
+    /// returned output are empty placeholders and must not be committed before
+    /// [`Self::reencode_memory_from_backbone`] replaces them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn track_backbone_with_deferred_memory(
+        &self,
+        backbone: &BackboneOutput,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        binarize_mask_for_memory: bool,
+        multimask_output: bool,
+        reverse: bool,
+        num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
+        self.track_backbone_with_mask_prompt_impl(
+            backbone,
+            frame_index,
+            is_conditioning,
+            state,
+            points,
+            bounding_box,
+            mask_input,
+            binarize_mask_for_memory,
+            multimask_output,
+            reverse,
+            num_frames,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn track_backbone_with_mask_prompt_impl(
+        &self,
+        backbone: &BackboneOutput,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<&Tensor>,
+        binarize_mask_for_memory: bool,
+        multimask_output: bool,
+        reverse: bool,
+        num_frames: Option<usize>,
+        run_memory_encoder: bool,
+        compact_memory: bool,
+    ) -> Result<Sam2FrameOutput> {
         let current = &backbone.vision_features;
         let current_pos = backbone.vision_pos_enc.last().unwrap();
         let (batch, channels, height, width) = current.dims4()?;
+        let profiling = std::env::var_os("SAM2_PROFILE_VIDEO_STAGES").is_some();
+        if profiling {
+            self.device.synchronize()?;
+        }
+        let mut profile_start = Instant::now();
+        macro_rules! profile_stage {
+            ($name:literal) => {
+                if profiling {
+                    self.device.synchronize()?;
+                    eprintln!(
+                        "SAM2_VIDEO_STAGE frame={} stage={} ms={:.6}",
+                        frame_index,
+                        $name,
+                        profile_start.elapsed().as_secs_f64() * 1000.
+                    );
+                    profile_start = Instant::now();
+                }
+            };
+        }
         let conditioned = if is_conditioning {
             // SAM2.1's published configs use directly_add_no_mem_embed on
             // initial conditioning frames rather than a dummy transformer key.
@@ -254,12 +381,14 @@ impl Sam2Base {
                 num_frames,
             )?
         };
+        profile_stage!("memory_attention");
         let (point_coords, point_labels, box_tensor) = self.prompt_tensors(points, bounding_box)?;
         let prompts = self.prompt_encoder.forward(
             point_coords.as_ref().zip(point_labels.as_ref()),
             box_tensor.as_ref(),
             mask_input,
         )?;
+        profile_stage!("prompt_encoder");
         let decoded = self.mask_decoder.forward(
             &conditioned,
             &self.prompt_encoder.get_dense_pe()?,
@@ -268,6 +397,7 @@ impl Sam2Base {
             multimask_output,
             &backbone.backbone_fpn[..2],
         )?;
+        profile_stage!("mask_decoder");
         let (decoded_masks, decoded_token) = if multimask_output {
             let best = decoded.iou_predictions.argmax_keepdim(1)?;
             let (_, _, mask_height, mask_width) = decoded.masks.dims4()?;
@@ -302,35 +432,10 @@ impl Sam2Base {
             self.config.image_size,
             false,
         )?;
-        // The memory encoder receives a scaled sigmoid probability, exactly as
-        // specified by the SAM2.1 inference configs.
-        let memory_mask = if binarize_mask_for_memory {
-            high_res_masks.gt(0f64)?.to_dtype(DType::F32)?.affine(
-                self.config.sigmoid_scale_for_mem_enc,
-                self.config.sigmoid_bias_for_mem_enc,
-            )?
-        } else {
-            sigmoid(&high_res_masks)?.affine(
-                self.config.sigmoid_scale_for_mem_enc,
-                self.config.sigmoid_bias_for_mem_enc,
-            )?
-        };
-        let mut encoded = self
-            .memory_encoder
-            // SAM2 writes memories from the raw backbone feature, rather than
-            // the feature already fused with prior memory attention.
-            .forward(current, &memory_mask, true)?;
+        profile_stage!("mask_selection_and_resize");
         let appearance = is_obj_appearing
             .to_dtype(DType::F32)?
             .reshape((batch, 1, 1, 1))?;
-        encoded.vision_features = encoded.vision_features.broadcast_add(
-            &appearance.affine(-1., 1.)?.broadcast_mul(
-                &self
-                    .no_obj_embed_spatial
-                    .reshape((1, 64, 1, 1))?
-                    .broadcast_as(encoded.vision_features.dims())?,
-            )?,
-        )?;
         let projected_pointer = self.obj_ptr_proj.forward(&decoded_token.squeeze(1)?)?;
         let object_pointer = projected_pointer
             .broadcast_mul(&appearance.reshape((batch, 1))?)?
@@ -340,16 +445,63 @@ impl Sam2Base {
                     .reshape((batch, 1))?
                     .broadcast_mul(&self.no_obj_ptr.broadcast_as((batch, 256))?)?,
             )?;
-        let frame = MemoryFrame {
-            memory_features: encoded.vision_features.clone(),
-            memory_pos_enc: encoded.vision_pos_enc.clone(),
-            object_pointer: object_pointer.clone(),
-            low_res_mask_logits: low_res_masks.clone(),
-        };
-        if is_conditioning {
-            state.insert_conditioning(frame_index, frame);
+        let (memory_features, memory_pos_enc) = if run_memory_encoder {
+            // The memory encoder receives a scaled sigmoid probability,
+            // exactly as specified by the SAM2.1 inference configs.
+            let memory_mask = if binarize_mask_for_memory {
+                high_res_masks.gt(0f64)?.to_dtype(DType::F32)?.affine(
+                    self.config.sigmoid_scale_for_mem_enc,
+                    self.config.sigmoid_bias_for_mem_enc,
+                )?
+            } else {
+                sigmoid(&high_res_masks)?.affine(
+                    self.config.sigmoid_scale_for_mem_enc,
+                    self.config.sigmoid_bias_for_mem_enc,
+                )?
+            };
+            let mut encoded = self
+                .memory_encoder
+                // SAM2 writes memories from the raw backbone feature, rather
+                // than the feature already fused with prior memory attention.
+                .forward(current, &memory_mask, true)?;
+            profile_stage!("memory_encoder");
+            encoded.vision_features = encoded.vision_features.broadcast_add(
+                &appearance.affine(-1., 1.)?.broadcast_mul(
+                    &self
+                        .no_obj_embed_spatial
+                        .reshape((1, 64, 1, 1))?
+                        .broadcast_as(encoded.vision_features.dims())?,
+                )?,
+            )?;
+            if self.device.is_cuda() || compact_memory {
+                // Match the reference predictor's compact temporal-memory
+                // storage. Selected memories are promoted back to the active
+                // compute dtype only while assembling an attention input.
+                encoded.vision_features = encoded.vision_features.to_dtype(DType::BF16)?;
+            }
+            let frame = MemoryFrame {
+                memory_features: encoded.vision_features.clone(),
+                memory_pos_enc: encoded.vision_pos_enc.clone(),
+                object_pointer: object_pointer.clone(),
+                low_res_mask_logits: low_res_masks.clone(),
+            };
+            if is_conditioning {
+                state.insert_conditioning(frame_index, frame);
+            } else {
+                state.insert_propagated(frame_index, frame);
+            }
+            (encoded.vision_features, encoded.vision_pos_enc)
         } else {
-            state.insert_propagated(frame_index, frame);
+            let empty = Tensor::zeros((0,), DType::F32, &self.device)?;
+            (empty.clone(), empty)
+        };
+        if profiling {
+            self.device.synchronize()?;
+            eprintln!(
+                "SAM2_VIDEO_STAGE frame={} stage=pointer_and_state ms={:.6}",
+                frame_index,
+                profile_start.elapsed().as_secs_f64() * 1000.
+            );
         }
         Ok(Sam2FrameOutput {
             conditioned_features: conditioned,
@@ -358,8 +510,8 @@ impl Sam2Base {
             iou_predictions: decoded.iou_predictions,
             object_score_logits: decoded.object_score_logits,
             object_pointer,
-            memory_features: encoded.vision_features,
-            memory_pos_enc: encoded.vision_pos_enc,
+            memory_features,
+            memory_pos_enc,
         })
     }
 
@@ -400,6 +552,43 @@ impl Sam2Base {
         state: &mut VideoInferenceState,
         _reverse: bool,
         _num_frames: Option<usize>,
+    ) -> Result<Sam2FrameOutput> {
+        self.track_mask_from_backbone_impl(
+            backbone,
+            mask,
+            frame_index,
+            is_conditioning,
+            state,
+            true,
+        )
+    }
+
+    pub(crate) fn track_mask_from_backbone_deferred_memory(
+        &self,
+        backbone: &BackboneOutput,
+        mask: &Tensor,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+    ) -> Result<Sam2FrameOutput> {
+        self.track_mask_from_backbone_impl(
+            backbone,
+            mask,
+            frame_index,
+            is_conditioning,
+            state,
+            false,
+        )
+    }
+
+    fn track_mask_from_backbone_impl(
+        &self,
+        backbone: &BackboneOutput,
+        mask: &Tensor,
+        frame_index: usize,
+        is_conditioning: bool,
+        state: &mut VideoInferenceState,
+        run_memory_encoder: bool,
     ) -> Result<Sam2FrameOutput> {
         let current = &backbone.vision_features;
         let batch = current.dim(0)?;
@@ -457,30 +646,39 @@ impl Sam2Base {
         } else {
             self.no_obj_ptr.broadcast_as((batch, 256))?
         };
-        let memory_mask = sigmoid(&high_res_masks)?.affine(
-            self.config.sigmoid_scale_for_mem_enc,
-            self.config.sigmoid_bias_for_mem_enc,
-        )?;
-        let mut encoded = self.memory_encoder.forward(current, &memory_mask, true)?;
-        if !appears {
-            encoded.vision_features = encoded.vision_features.broadcast_add(
-                &self
-                    .no_obj_embed_spatial
-                    .reshape((1, 64, 1, 1))?
-                    .broadcast_as(encoded.vision_features.dims())?,
+        let (memory_features, memory_pos_enc) = if run_memory_encoder {
+            let memory_mask = sigmoid(&high_res_masks)?.affine(
+                self.config.sigmoid_scale_for_mem_enc,
+                self.config.sigmoid_bias_for_mem_enc,
             )?;
-        }
-        let frame = MemoryFrame {
-            memory_features: encoded.vision_features.clone(),
-            memory_pos_enc: encoded.vision_pos_enc.clone(),
-            object_pointer: object_pointer.clone(),
-            low_res_mask_logits: low_res_masks.clone(),
-        };
-        if is_conditioning {
-            state.insert_conditioning(frame_index, frame);
+            let mut encoded = self.memory_encoder.forward(current, &memory_mask, true)?;
+            if !appears {
+                encoded.vision_features = encoded.vision_features.broadcast_add(
+                    &self
+                        .no_obj_embed_spatial
+                        .reshape((1, 64, 1, 1))?
+                        .broadcast_as(encoded.vision_features.dims())?,
+                )?;
+            }
+            if self.device.is_cuda() {
+                encoded.vision_features = encoded.vision_features.to_dtype(DType::BF16)?;
+            }
+            let frame = MemoryFrame {
+                memory_features: encoded.vision_features.clone(),
+                memory_pos_enc: encoded.vision_pos_enc.clone(),
+                object_pointer: object_pointer.clone(),
+                low_res_mask_logits: low_res_masks.clone(),
+            };
+            if is_conditioning {
+                state.insert_conditioning(frame_index, frame);
+            } else {
+                state.insert_propagated(frame_index, frame);
+            }
+            (encoded.vision_features, encoded.vision_pos_enc)
         } else {
-            state.insert_propagated(frame_index, frame);
-        }
+            let empty = Tensor::zeros((0,), DType::F32, &self.device)?;
+            (empty.clone(), empty)
+        };
         Ok(Sam2FrameOutput {
             conditioned_features: conditioned,
             low_res_masks,
@@ -492,8 +690,8 @@ impl Sam2Base {
                 &self.device,
             )?,
             object_pointer,
-            memory_features: encoded.vision_features,
-            memory_pos_enc: encoded.vision_pos_enc,
+            memory_features,
+            memory_pos_enc,
         })
     }
 
@@ -577,6 +775,9 @@ impl Sam2Base {
                     .broadcast_as(encoded.vision_features.dims())?,
             )?,
         )?;
+        if self.device.is_cuda() {
+            encoded.vision_features = encoded.vision_features.to_dtype(DType::BF16)?;
+        }
         Ok(MemoryFrame {
             memory_features: encoded.vision_features,
             memory_pos_enc: encoded.vision_pos_enc,
@@ -612,6 +813,7 @@ impl Sam2Base {
                 &mut positions,
                 frame,
                 Some(&conditioning_tpos),
+                current.dtype(),
             )?;
         }
         // The most recent frame always participates; older slots follow the
@@ -628,7 +830,13 @@ impl Sam2Base {
                     .maskmem_tpos_enc
                     .narrow(0, self.config.num_maskmem - t_pos - 1, 1)?
                     .squeeze(0)?;
-                Self::push_spatial_memory(&mut memories, &mut positions, index, Some(&temporal))?;
+                Self::push_spatial_memory(
+                    &mut memories,
+                    &mut positions,
+                    index,
+                    Some(&temporal),
+                    current.dtype(),
+                )?;
             }
         }
         if memories.is_empty() {
@@ -720,11 +928,13 @@ impl Sam2Base {
         positions: &mut Vec<Tensor>,
         frame: &MemoryFrame,
         temporal: Option<&Tensor>,
+        compute_dtype: DType,
     ) -> Result<()> {
         let (batch, channels, height, width) = frame.memory_features.dims4()?;
         memories.push(
             frame
                 .memory_features
+                .to_dtype(compute_dtype)?
                 .reshape((batch, channels, height * width))?
                 .permute((2, 0, 1))?,
         );
@@ -763,42 +973,7 @@ impl Sam2Base {
         output_height: usize,
         output_width: usize,
     ) -> Result<Tensor> {
-        let (batch, channels, input_height, input_width) = input.dims4()?;
-        fn weights(input: usize, output: usize, device: &Device) -> Result<Tensor> {
-            let scale = output as f32 / input as f32;
-            let filter_scale = scale.min(1.);
-            let support = 1. / filter_scale;
-            let mut values = vec![0f32; output * input];
-            for out in 0..output {
-                let center = (out as f32 + 0.5) / scale - 0.5;
-                let start = (center - support).ceil() as isize;
-                let end = (center + support).floor() as isize;
-                let mut sum = 0f32;
-                for index in start..=end {
-                    if index >= 0 && (index as usize) < input {
-                        let value = (1. - ((index as f32 - center) * filter_scale).abs()).max(0.);
-                        values[out * input + index as usize] = value;
-                        sum += value;
-                    }
-                }
-                for index in 0..input {
-                    values[out * input + index] /= sum;
-                }
-            }
-            Tensor::from_vec(values, (output, input), device)
-        }
-        let height_weights = weights(input_height, output_height, input.device())?;
-        let width_weights = weights(input_width, output_width, input.device())?;
-        let height = input
-            .permute((0, 1, 3, 2))?
-            .reshape((batch * channels * input_width, input_height))?
-            .matmul(&height_weights.t()?)?
-            .reshape((batch, channels, input_width, output_height))?
-            .permute((0, 1, 3, 2))?;
-        height
-            .reshape((batch * channels * output_height, input_width))?
-            .matmul(&width_weights.t()?)?
-            .reshape((batch, channels, output_height, output_width))
+        crate::transforms::antialiased_bilinear_resize(input, output_height, output_width)
     }
 
     fn prompt_tensors(

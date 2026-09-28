@@ -13,6 +13,166 @@ use crate::{
     ops::{Activation, LayerNorm2d, Mlp},
 };
 
+static PRINTED_DECODER_PROFILE_LAYOUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn sam2_conv_transpose2x2_nchw_f32(
+        input: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        output_elements: u64,
+        input_channels: u32,
+        output_channels: u32,
+        input_height: u32,
+        input_width: u32,
+        residual_batch_stride: u64,
+        gelu: bool,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+struct CudaConvTranspose2x2Residual {
+    bias: Tensor,
+    gelu: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp3 for CudaConvTranspose2x2Residual {
+    fn name(&self) -> &'static str {
+        "sam2-conv-transpose2x2-residual-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _input: &candle_core::CpuStorage,
+        _input_layout: &candle_core::Layout,
+        _weight: &candle_core::CpuStorage,
+        _weight_layout: &candle_core::Layout,
+        _residual: &candle_core::CpuStorage,
+        _residual_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("2x2 transposed convolution is only implemented for cuda")
+    }
+
+    fn cuda_fwd(
+        &self,
+        input: &candle_core::CudaStorage,
+        input_layout: &candle_core::Layout,
+        weight: &candle_core::CudaStorage,
+        weight_layout: &candle_core::Layout,
+        residual: &candle_core::CudaStorage,
+        residual_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        if input.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || residual.dtype() != DType::F32
+            || self.bias.dtype() != DType::F32
+        {
+            candle_core::bail!("2x2 transposed convolution requires f32")
+        }
+        let (batch, input_channels, input_height, input_width) = input_layout.shape().dims4()?;
+        let (weight_channels, output_channels, kernel_h, kernel_w) =
+            weight_layout.shape().dims4()?;
+        let output_shape = candle_core::Shape::from_dims(&[
+            batch,
+            output_channels,
+            input_height * 2,
+            input_width * 2,
+        ]);
+        let (residual_batch, residual_channels, residual_height, residual_width) =
+            residual_layout.shape().dims4()?;
+        if input_channels != weight_channels
+            || kernel_h != 2
+            || kernel_w != 2
+            || !matches!(residual_batch, 1) && residual_batch != batch
+            || residual_channels != output_channels
+            || residual_height != input_height * 2
+            || residual_width != input_width * 2
+            || self.bias.dims1()? != output_channels
+        {
+            candle_core::bail!("invalid 2x2 transposed-convolution shape")
+        }
+        let Some((input_start, _)) = input_layout.contiguous_offsets() else {
+            candle_core::bail!("2x2 transposed-convolution input must be contiguous")
+        };
+        let Some((weight_start, _)) = weight_layout.contiguous_offsets() else {
+            candle_core::bail!("2x2 transposed-convolution weight must be contiguous")
+        };
+        let Some((residual_start, _)) = residual_layout.contiguous_offsets() else {
+            candle_core::bail!("2x2 transposed-convolution residual must be contiguous")
+        };
+        let (bias_storage, bias_layout) = self.bias.storage_and_layout();
+        let candle_core::Storage::Cuda(bias_storage) = &*bias_storage else {
+            candle_core::bail!("2x2 transposed-convolution bias must be on cuda")
+        };
+        let Some((bias_start, _)) = bias_layout.contiguous_offsets() else {
+            candle_core::bail!("2x2 transposed-convolution bias must be contiguous")
+        };
+        let output_elements = output_shape.elem_count();
+        let dev = input.device();
+        let stream = dev.cuda_stream();
+        let input = input.as_cuda_slice::<f32>()?.slice(input_start..);
+        let weight = weight.as_cuda_slice::<f32>()?.slice(weight_start..);
+        let residual = residual.as_cuda_slice::<f32>()?.slice(residual_start..);
+        let bias = bias_storage.as_cuda_slice::<f32>()?.slice(bias_start..);
+        // SAFETY: the external kernel writes every element of the validated output shape.
+        let mut output = unsafe { dev.alloc::<f32>(output_elements)? };
+        let (input_ptr, input_guard) = input.device_ptr(&stream);
+        let (weight_ptr, weight_guard) = weight.device_ptr(&stream);
+        let (bias_ptr, bias_guard) = bias.device_ptr(&stream);
+        let (residual_ptr, residual_guard) = residual.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_conv_transpose2x2_nchw_f32(
+                input_ptr as *const f32,
+                weight_ptr as *const f32,
+                bias_ptr as *const f32,
+                residual_ptr as *const f32,
+                output_ptr as *mut f32,
+                output_elements as u64,
+                input_channels as u32,
+                output_channels as u32,
+                input_height as u32,
+                input_width as u32,
+                if residual_batch == 1 {
+                    0
+                } else {
+                    (output_channels * input_height * 2 * input_width * 2) as u64
+                },
+                self.gelu,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("2x2 transposed-convolution CUDA launch failed with status {status}")
+        }
+        drop((
+            input_guard,
+            weight_guard,
+            bias_guard,
+            residual_guard,
+            output_guard,
+        ));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: dev.clone(),
+            },
+            output_shape,
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MaskDecoderOutput {
     pub masks: Tensor,
@@ -96,8 +256,50 @@ pub struct MaskDecoder {
 }
 
 impl MaskDecoder {
+    fn upconv_residual(
+        conv: &ConvTranspose2d,
+        input: &Tensor,
+        residual: &Tensor,
+        gelu: bool,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if input.device().is_cuda()
+            && input.dtype() == DType::F32
+            && input.is_contiguous()
+            && residual.is_contiguous()
+            // The final 64 -> 32 upsampling stage is faster as one direct
+            // NCHW kernel. cuDNN remains faster for the 256 -> 64 stage.
+            && gelu
+            && std::env::var("SAM2_CUDA_FINAL_TRANSPOSE2X2").as_deref() != Ok("0")
+            && let Some(bias) = conv.bias()
+        {
+            return input.apply_op3_no_bwd(
+                conv.weight(),
+                residual,
+                &CudaConvTranspose2x2Residual {
+                    bias: bias.clone(),
+                    gelu,
+                },
+            );
+        }
+        let output = conv.forward_add_residual_cpu(input, residual)?;
+        if gelu { output.gelu_erf() } else { Ok(output) }
+    }
+
     fn position_for_batch(image_pe: &Tensor, batch: usize) -> Result<Tensor> {
         let (_, _, height, width) = image_pe.dims4()?;
+        // Every prompt in an automatic-mask batch belongs to the same encoded
+        // image, so its dense positional encoding is identical. Keep the
+        // batch-one CPU tensor and let the transformer's additions broadcast
+        // it. Expanding first caused the later NCHW->token preparation to
+        // materialize another ~1 GiB tensor at batch 64 on a 64x64 grid.
+        if image_pe.device().is_cpu()
+            && image_pe.dim(0)? == 1
+            && std::env::var_os("SAM2_CPU_DECODER_BROADCAST_IMAGE_PE")
+                .is_none_or(|value| value != "0")
+        {
+            return Ok(image_pe.clone());
+        }
         if image_pe.dims() == [batch, 256usize, height, width] {
             Ok(image_pe.clone())
         } else {
@@ -342,6 +544,27 @@ impl MaskDecoder {
     ) -> Result<MaskDecoderOutput> {
         assert_eq!(high_res_features.len(), 2);
         let batch = sparse_prompt_embeddings.dim(0)?;
+        let profiling = std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some();
+        let profile_layout = profiling
+            && !PRINTED_DECODER_PROFILE_LAYOUT.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if profiling {
+            image_embeddings.device().synchronize()?;
+        }
+        let mut profile_start = Instant::now();
+        macro_rules! profile_stage {
+            ($name:expr) => {
+                if profiling {
+                    image_embeddings.device().synchronize()?;
+                    eprintln!(
+                        "SAM2_MASK_DECODER_STAGE stage={} batch={} ms={:.6}",
+                        $name,
+                        batch,
+                        profile_start.elapsed().as_secs_f64() * 1000.
+                    );
+                    profile_start = Instant::now();
+                }
+            };
+        }
         let output_tokens = Tensor::cat(
             &[&self.obj_score_token, &self.iou_token, &self.mask_tokens],
             0,
@@ -349,45 +572,132 @@ impl MaskDecoder {
         .unsqueeze(0)?
         .broadcast_as((batch, 6usize, 256usize))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
-        let src = image_embeddings.broadcast_add(dense_prompt_embeddings)?;
         let position = Self::position_for_batch(image_pe, batch)?;
-        let (hs, src) = self.transformer.forward(&src, &position, &tokens)?;
+        profile_stage!("token_setup");
+        let (hs, src) = self.transformer.forward(
+            image_embeddings,
+            dense_prompt_embeddings,
+            &position,
+            &tokens,
+        )?;
+        profile_stage!("transformer");
         let iou_token_out = hs.narrow(1, 1, 1)?.squeeze(1)?;
         let mask_tokens = hs.narrow(1, 2, 4)?;
         let object_score_logits = self
             .object_score_head
             .forward(&hs.narrow(1, 0, 1)?.squeeze(1)?)?;
         let (_, c, h, w) = image_embeddings.dims4()?;
-        let src = src.permute((0, 2, 1))?.reshape((batch, c, h, w))?;
+        let src = if src.device().is_cpu()
+            && src.is_contiguous()
+            && std::env::var_os("SAM2_CPU_DECODER_ZERO_COPY_UPCONV")
+                .is_none_or(|value| value != "0")
+        {
+            // The transformer returns contiguous Bx(HW)xC tokens. View that
+            // storage as BHWC and permute it to a zero-copy NCHW view. The
+            // linked Candle transposed-convolution path consumes this
+            // pixel-major layout directly, avoiding a 4 MiB reorder per
+            // prompt decode.
+            src.reshape((batch, h, w, c))?.permute((0, 3, 1, 2))?
+        } else {
+            src.permute((0, 2, 1))?.reshape((batch, c, h, w))?
+        };
+        if profile_layout {
+            eprintln!(
+                "SAM2_AMG_LAYOUT_RS stage=upconv_0_input shape={:?} stride={:?}",
+                src.dims(),
+                src.stride()
+            );
+        }
+        profile_stage!("token_heads_and_layout");
         let skip = if preprojected {
             high_res_features[1].clone()
         } else {
             self.conv_s1.forward_fused_bias_cpu(&high_res_features[1])?
         };
-        let x = self.upconv_0.forward_add_residual_cpu(&src, &skip)?;
-        let x = self.upnorm_1.forward(&x)?.gelu_erf()?;
+        let x = Self::upconv_residual(&self.upconv_0, &src, &skip, false)?;
+        if profile_layout {
+            eprintln!(
+                "SAM2_AMG_LAYOUT_RS stage=upconv_0_output shape={:?} stride={:?}",
+                x.dims(),
+                x.stride()
+            );
+        }
+        profile_stage!("upconv_0");
+        let x = self.upnorm_1.forward_gelu(&x)?;
+        if profile_layout {
+            eprintln!(
+                "SAM2_AMG_LAYOUT_RS stage=upconv_3_input shape={:?} stride={:?}",
+                x.dims(),
+                x.stride()
+            );
+        }
+        profile_stage!("upnorm_gelu");
+        let skip_start = profiling.then(Instant::now);
         let skip = if preprojected {
             high_res_features[0].clone()
         } else {
             self.conv_s0.forward_fused_bias_cpu(&high_res_features[0])?
         };
-        let x = self
-            .upconv_3
-            .forward_add_residual_cpu(&x, &skip)?
-            .gelu_erf()?;
+        if let Some(start) = skip_start {
+            image_embeddings.device().synchronize()?;
+            eprintln!(
+                "SAM2_MASK_DECODER_SUBSTAGE stage=skip_0 batch={} ms={:.6}",
+                batch,
+                start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        let x = if profiling && x.device().is_cpu() {
+            let core_start = Instant::now();
+            let x = Self::upconv_residual(&self.upconv_3, &x, &skip, false)?;
+            image_embeddings.device().synchronize()?;
+            eprintln!(
+                "SAM2_MASK_DECODER_SUBSTAGE stage=upconv_core_3 batch={} ms={:.6}",
+                batch,
+                core_start.elapsed().as_secs_f64() * 1000.
+            );
+            let gelu_start = Instant::now();
+            let x = x.gelu_erf()?;
+            image_embeddings.device().synchronize()?;
+            eprintln!(
+                "SAM2_MASK_DECODER_SUBSTAGE stage=final_gelu batch={} ms={:.6}",
+                batch,
+                gelu_start.elapsed().as_secs_f64() * 1000.
+            );
+            x
+        } else {
+            Self::upconv_residual(&self.upconv_3, &x, &skip, true)?
+        };
+        if profile_layout {
+            eprintln!(
+                "SAM2_AMG_LAYOUT_RS stage=upconv_3_output shape={:?} stride={:?}",
+                x.dims(),
+                x.stride()
+            );
+        }
+        profile_stage!("upconv_3_gelu");
         let mut hyper = Vec::with_capacity(4);
         for (index, network) in self.hypernetworks.iter().enumerate() {
             hyper.push(network.forward(&mask_tokens.narrow(1, index, 1)?.squeeze(1)?)?);
         }
         let hyper_refs: Vec<&Tensor> = hyper.iter().collect();
         let hyper = Tensor::stack(&hyper_refs, 1)?;
+        profile_stage!("hypernetworks");
         let (_, channels, up_h, up_w) = x.dims4()?;
         let masks = hyper
             .matmul(&x.contiguous()?.reshape((batch, channels, up_h * up_w))?)?
             .reshape((batch, 4usize, up_h, up_w))?;
+        profile_stage!("mask_projection");
         let iou_predictions = self.iou_head.forward(&iou_token_out)?;
         let (masks, iou_predictions) =
             self.select_masks(&masks, &iou_predictions, multimask_output)?;
+        if profiling {
+            image_embeddings.device().synchronize()?;
+            eprintln!(
+                "SAM2_MASK_DECODER_STAGE stage=iou_and_selection batch={} ms={:.6}",
+                batch,
+                profile_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
         Ok(MaskDecoderOutput {
             masks,
             iou_predictions,
@@ -467,20 +777,30 @@ impl MaskDecoder {
         .unsqueeze(0)?
         .broadcast_as((batch, 6usize, 256usize))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
-        let src = image_embeddings.broadcast_add(dense_prompt_embeddings)?;
         let position = Self::position_for_batch(image_pe, batch)?;
         profile.token_setup_ms = start.elapsed().as_secs_f64() * 1000.;
 
         let start = Instant::now();
-        let ((hs, src), transformer_profile) = self
-            .transformer
-            .forward_profiled(&src, &position, &tokens)?;
+        let ((hs, src), transformer_profile) = self.transformer.forward_profiled(
+            image_embeddings,
+            dense_prompt_embeddings,
+            &position,
+            &tokens,
+        )?;
         profile.transformer_ms = start.elapsed().as_secs_f64() * 1000.;
         profile.transformer = transformer_profile;
         let iou_token_out = hs.narrow(1, 1, 1)?.squeeze(1)?;
         let mask_tokens = hs.narrow(1, 2, 4)?;
         let (_, c, h, w) = image_embeddings.dims4()?;
-        let src = src.permute((0, 2, 1))?.reshape((batch, c, h, w))?;
+        let src = if src.device().is_cpu()
+            && src.is_contiguous()
+            && std::env::var_os("SAM2_CPU_DECODER_ZERO_COPY_UPCONV")
+                .is_none_or(|value| value != "0")
+        {
+            src.reshape((batch, h, w, c))?.permute((0, 3, 1, 2))?
+        } else {
+            src.permute((0, 2, 1))?.reshape((batch, c, h, w))?
+        };
 
         let start = Instant::now();
         let skip = if preprojected {
@@ -490,11 +810,11 @@ impl MaskDecoder {
         };
         profile.skip_1_ms = start.elapsed().as_secs_f64() * 1000.;
         let core_start = Instant::now();
-        let x = self.upconv_0.forward_add_residual_cpu(&src, &skip)?;
+        let x = Self::upconv_residual(&self.upconv_0, &src, &skip, false)?;
         profile.upconv_core_0_ms = core_start.elapsed().as_secs_f64() * 1000.;
         profile.upconv_0_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
-        let x = self.upnorm_1.forward(&x)?.gelu_erf()?;
+        let x = self.upnorm_1.forward_gelu(&x)?;
         profile.upnorm_gelu_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
         let skip = if preprojected {
@@ -504,7 +824,7 @@ impl MaskDecoder {
         };
         profile.skip_0_ms = start.elapsed().as_secs_f64() * 1000.;
         let core_start = Instant::now();
-        let x = self.upconv_3.forward_add_residual_cpu(&x, &skip)?;
+        let x = Self::upconv_residual(&self.upconv_3, &x, &skip, false)?;
         profile.upconv_core_3_ms = core_start.elapsed().as_secs_f64() * 1000.;
         let gelu_start = Instant::now();
         let x = x.gelu_erf()?;

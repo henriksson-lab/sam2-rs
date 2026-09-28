@@ -8,14 +8,181 @@ use rayon::prelude::*;
 /// The specialized case writes each 256-channel token once, with only a
 /// worker-local stack row, instead of allocating an image-sized sum tensor.
 pub fn layer_norm_add_residual(norm: &LayerNorm, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
-    // Keep this experimental until a quiet-host end-to-end gain is verified.
-    if std::env::var_os("SAM2_CPU_DECODER_FUSED_RESIDUAL_NORM").is_none_or(|value| value != "1") {
+    // The pinned four-process cached-prompt suite establishes the fused path
+    // as the CPU default. Keep the ordinary composition as an attribution and
+    // portability fallback; unsupported devices/layouts also use it below.
+    if std::env::var_os("SAM2_CPU_DECODER_FUSED_RESIDUAL_NORM").is_some_and(|value| value == "0") {
         return norm.forward(&x.broadcast_add(residual)?);
     }
     if let Some(output) = layer_norm_add_residual_cpu(norm, x, residual)? {
         return Ok(output);
     }
+    #[cfg(feature = "cuda")]
+    if std::env::var_os("SAM2_CUDA_DECODER_FUSED_RESIDUAL_NORM").is_none_or(|value| value != "0")
+        && let Some(output) = layer_norm_add_residual_cuda(norm, x, residual)?
+    {
+        return Ok(output);
+    }
     norm.forward(&x.broadcast_add(residual)?)
+}
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn sam2_layer_norm_residual_f32(
+        x: *const f32,
+        residual: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        rows: i32,
+        columns: i32,
+        eps: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaLayerNormResidual<'a> {
+    norm: &'a LayerNorm,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp2 for CudaLayerNormResidual<'_> {
+    fn name(&self) -> &'static str {
+        "sam2-layer-norm-residual-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _x: &candle_core::CpuStorage,
+        _x_layout: &candle_core::Layout,
+        _residual: &candle_core::CpuStorage,
+        _residual_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("fused residual LayerNorm is only implemented for CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        x: &candle_core::CudaStorage,
+        x_layout: &candle_core::Layout,
+        residual: &candle_core::CudaStorage,
+        residual_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        let Some(bias_tensor) = self.norm.bias() else {
+            candle_core::bail!("fused residual LayerNorm requires bias")
+        };
+        let (weight_storage, weight_layout) = self.norm.weight().storage_and_layout();
+        let (bias_storage, bias_layout) = bias_tensor.storage_and_layout();
+        let (Storage::Cuda(weight), Storage::Cuda(bias)) = (&*weight_storage, &*bias_storage)
+        else {
+            candle_core::bail!("fused residual LayerNorm parameters must be on CUDA")
+        };
+        let columns = *x_layout.shape().dims().last().ok_or_else(|| {
+            candle_core::Error::Msg("LayerNorm requires a non-scalar input".into())
+        })?;
+        let elements = x_layout.shape().elem_count();
+        if x.dtype() != DType::F32
+            || residual.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || bias.dtype() != DType::F32
+            || x_layout.shape() != residual_layout.shape()
+            || columns != 256
+            || self.norm.weight().elem_count() != columns
+            || bias_tensor.elem_count() != columns
+        {
+            candle_core::bail!("unsupported fused residual LayerNorm input")
+        }
+        let Some((x_start, _)) = x_layout.contiguous_offsets() else {
+            candle_core::bail!("fused residual LayerNorm requires contiguous input")
+        };
+        let Some((residual_start, _)) = residual_layout.contiguous_offsets() else {
+            candle_core::bail!("fused residual LayerNorm requires contiguous residual")
+        };
+        let Some((weight_start, _)) = weight_layout.contiguous_offsets() else {
+            candle_core::bail!("fused residual LayerNorm requires contiguous weight")
+        };
+        let Some((bias_start, _)) = bias_layout.contiguous_offsets() else {
+            candle_core::bail!("fused residual LayerNorm requires contiguous bias")
+        };
+        let device = x.device();
+        let stream = device.cuda_stream();
+        let x = x.as_cuda_slice::<f32>()?.slice(x_start..);
+        let residual = residual.as_cuda_slice::<f32>()?.slice(residual_start..);
+        let weight = weight.as_cuda_slice::<f32>()?.slice(weight_start..);
+        let bias = bias.as_cuda_slice::<f32>()?.slice(bias_start..);
+        // SAFETY: The kernel writes every element of the validated input shape.
+        let mut output = unsafe { device.alloc::<f32>(elements)? };
+        let (x_ptr, x_guard) = x.device_ptr(&stream);
+        let (residual_ptr, residual_guard) = residual.device_ptr(&stream);
+        let (weight_ptr, weight_guard) = weight.device_ptr(&stream);
+        let (bias_ptr, bias_guard) = bias.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_layer_norm_residual_f32(
+                x_ptr as *const f32,
+                residual_ptr as *const f32,
+                weight_ptr as *const f32,
+                bias_ptr as *const f32,
+                output_ptr as *mut f32,
+                (elements / columns) as i32,
+                columns as i32,
+                self.norm.eps() as f32,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("fused residual LayerNorm CUDA launch failed with status {status}")
+        }
+        drop((
+            x_guard,
+            residual_guard,
+            weight_guard,
+            bias_guard,
+            output_guard,
+        ));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            x_layout.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn layer_norm_add_residual_cuda(
+    norm: &LayerNorm,
+    x: &Tensor,
+    residual: &Tensor,
+) -> Result<Option<Tensor>> {
+    let Some(bias) = norm.bias() else {
+        return Ok(None);
+    };
+    if !x.device().is_cuda()
+        || x.dtype() != DType::F32
+        || residual.dtype() != DType::F32
+        || norm.weight().dtype() != DType::F32
+        || bias.dtype() != DType::F32
+        || !norm.remove_mean()
+        || x.dims() != residual.dims()
+        || x.dims().last() != Some(&256)
+        || x.elem_count() < 4096
+        || x.layout().contiguous_offsets().is_none()
+        || residual.layout().contiguous_offsets().is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(x.apply_op2_no_bwd(
+        residual,
+        &CudaLayerNormResidual { norm },
+    )?))
 }
 
 fn layer_norm_add_residual_cpu(

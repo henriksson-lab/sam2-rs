@@ -3,16 +3,290 @@
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use candle_core::{DType, Device, Result, Tensor};
+use rayon::prelude::*;
 
 use crate::{
-    BackboneOutput, ImageEncoder, ImageEncoderProfile, MaskDecoder, MaskDecoderConfig,
-    MaskDecoderOutput, MaskDecoderProfile, PromptEncoder, Sam2Base, Sam2Config, Sam2FrameOutput,
-    Sam2ImageTransforms, Sam2Variant, VideoInferenceState,
+    BackboneOutput, ImageEncoder, ImageEncoderProfile, ImageGeometry, MaskDecoder,
+    MaskDecoderConfig, MaskDecoderOutput, MaskDecoderProfile, PromptEncoder, Sam2Base, Sam2Config,
+    Sam2FrameOutput, Sam2ImageTransforms, Sam2Variant, VideoInferenceState,
     ops::{
-        MaskRle, batch_ranges, build_all_layer_point_grids, generate_crop_boxes,
-        restore_video_masks, uncrop_rle,
+        MaskRle, batch_ranges, build_all_layer_point_grids, calculate_stability_score,
+        generate_crop_boxes, restore_video_masks, uncrop_rle,
     },
 };
+
+/// Counts the two thresholded areas needed by the AMG stability score while
+/// bilinearly restoring a mask, without materializing the restored masks.
+/// The interpolation arithmetic deliberately mirrors Candle's CPU
+/// `upsample_bilinear2d(..., false)` implementation so the fused path makes
+/// the same threshold decisions as the composed operations.
+#[derive(Debug)]
+struct CpuBilinearStabilityCounts {
+    output_height: usize,
+    output_width: usize,
+    high_threshold: f32,
+    low_threshold: f32,
+}
+
+impl candle_core::CustomOp1 for CpuBilinearStabilityCounts {
+    fn name(&self) -> &'static str {
+        "sam2-cpu-bilinear-stability-counts-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &candle_core::CpuStorage,
+        layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let (masks, channels, input_height, input_width) = layout.shape().dims4()?;
+        if channels != 1 || masks == 0 || input_height == 0 || input_width == 0 {
+            candle_core::bail!("bilinear stability counts require non-empty one-channel masks")
+        }
+        if self.output_height == 0 || self.output_width == 0 {
+            candle_core::bail!("bilinear stability counts require a non-empty output")
+        }
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("bilinear stability counts require contiguous masks")
+        };
+        let input = &storage.as_slice::<f32>()?[start..end];
+
+        let height_scale = input_height as f64 / self.output_height as f64;
+        let width_scale = input_width as f64 / self.output_width as f64;
+        let height_indices = (0..self.output_height)
+            .map(|output_y| {
+                let source = (height_scale * (output_y as f64 + 0.5) - 0.5).max(0.0);
+                let low = source.floor() as usize;
+                (
+                    low,
+                    (low + 1).min(input_height - 1),
+                    (source - low as f64).clamp(0.0, 1.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let width_indices = (0..self.output_width)
+            .map(|output_x| {
+                let source = (width_scale * (output_x as f64 + 0.5) - 0.5).max(0.0);
+                let low = source.floor() as usize;
+                (
+                    low,
+                    (low + 1).min(input_width - 1),
+                    (source - low as f64).clamp(0.0, 1.0),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let pixels_per_mask = input_height * input_width;
+        let mut counts = vec![0u32; masks * 2];
+        counts
+            .par_chunks_mut(2)
+            .enumerate()
+            .for_each(|(mask, counts)| {
+                let input = &input[mask * pixels_per_mask..(mask + 1) * pixels_per_mask];
+                let mut high = 0u32;
+                let mut low = 0u32;
+                for &(y0, y1, weight_y) in &height_indices {
+                    let row0 = y0 * input_width;
+                    let row1 = y1 * input_width;
+                    for &(x0, x1, weight_x) in &width_indices {
+                        let v00 = input[row0 + x0] as f64;
+                        let v10 = input[row0 + x1] as f64;
+                        let v01 = input[row1 + x0] as f64;
+                        let v11 = input[row1 + x1] as f64;
+                        let top = v00 * (1.0 - weight_x) + v10 * weight_x;
+                        let bottom = v01 * (1.0 - weight_x) + v11 * weight_x;
+                        // Candle converts the interpolated f64 back to the
+                        // input dtype before the following threshold op.
+                        let value = (top * (1.0 - weight_y) + bottom * weight_y) as f32;
+                        high += u32::from(value > self.high_threshold);
+                        low += u32::from(value > self.low_threshold);
+                    }
+                }
+                counts[0] = high;
+                counts[1] = low;
+            });
+        Ok((
+            candle_core::CpuStorage::U32(counts),
+            candle_core::Shape::from_dims(&[masks, 2]),
+        ))
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn sam2_threshold_pack_u32_f32(
+        input: *const f32,
+        output: *mut u32,
+        pixels_per_mask: u64,
+        words_per_mask: u64,
+        output_words: u64,
+        threshold: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    fn sam2_bilinear_stability_counts_f32(
+        input: *const f32,
+        counts: *mut u32,
+        masks: i32,
+        input_height: i32,
+        input_width: i32,
+        output_height: i32,
+        output_width: i32,
+        high_threshold: f32,
+        low_threshold: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaBilinearStabilityCounts {
+    output_height: usize,
+    output_width: usize,
+    high_threshold: f32,
+    low_threshold: f32,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for CudaBilinearStabilityCounts {
+    fn name(&self) -> &'static str {
+        "sam2-bilinear-stability-counts-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("bilinear stability counts are only implemented for cuda")
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        if storage.dtype() != DType::F32 {
+            candle_core::bail!("bilinear stability counts require f32")
+        }
+        let (masks, channels, input_height, input_width) = layout.shape().dims4()?;
+        if channels != 1 || masks == 0 {
+            candle_core::bail!("bilinear stability counts require non-empty one-channel masks")
+        }
+        let Some((start, _)) = layout.contiguous_offsets() else {
+            candle_core::bail!("bilinear stability counts require contiguous masks")
+        };
+        let device = storage.device();
+        let stream = device.cuda_stream();
+        let input = storage.as_cuda_slice::<f32>()?.slice(start..);
+        // SAFETY: the kernel writes two counters for every validated mask.
+        let mut output = unsafe { device.alloc::<u32>(masks * 2)? };
+        let (input_ptr, input_guard) = input.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_bilinear_stability_counts_f32(
+                input_ptr as *const f32,
+                output_ptr as *mut u32,
+                masks as i32,
+                input_height as i32,
+                input_width as i32,
+                self.output_height as i32,
+                self.output_width as i32,
+                self.high_threshold,
+                self.low_threshold,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("bilinear stability CUDA launch failed with status {status}")
+        }
+        drop((input_guard, output_guard));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::U32(output),
+                device: device.clone(),
+            },
+            candle_core::Shape::from_dims(&[masks, 2]),
+        ))
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaThresholdPack {
+    threshold: f32,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for CudaThresholdPack {
+    fn name(&self) -> &'static str {
+        "sam2-threshold-pack-u32-f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("threshold packing is only implemented for cuda")
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+
+        if storage.dtype() != DType::F32 {
+            candle_core::bail!("threshold packing requires f32")
+        }
+        let (masks, channels, height, width) = layout.shape().dims4()?;
+        if channels != 1 {
+            candle_core::bail!("threshold packing requires one channel")
+        }
+        let Some((start, _)) = layout.contiguous_offsets() else {
+            candle_core::bail!("threshold packing requires contiguous masks")
+        };
+        let pixels = height * width;
+        let words = pixels.div_ceil(32);
+        let output_words = masks * words;
+        let output_shape = candle_core::Shape::from_dims(&[masks, words]);
+        let dev = storage.device();
+        let stream = dev.cuda_stream();
+        let input = storage.as_cuda_slice::<f32>()?.slice(start..);
+        // SAFETY: the kernel writes each word in the validated output shape.
+        let mut output = unsafe { dev.alloc::<u32>(output_words)? };
+        let (input_ptr, input_guard) = input.device_ptr(&stream);
+        let (output_ptr, output_guard) = output.device_ptr_mut(&stream);
+        let status = unsafe {
+            sam2_threshold_pack_u32_f32(
+                input_ptr as *const f32,
+                output_ptr as *mut u32,
+                pixels as u64,
+                words as u64,
+                output_words as u64,
+                self.threshold,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("threshold-pack CUDA launch failed with status {status}")
+        }
+        drop((input_guard, output_guard));
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::U32(output),
+                device: dev.clone(),
+            },
+            output_shape,
+        ))
+    }
+}
 
 /// A point in pixel coordinates in the model's 1024x1024 input space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,7 +494,18 @@ pub struct InteractiveVideoSession {
     frames: Vec<Tensor>,
     state: VideoInferenceState,
     model_states: BTreeMap<u32, VideoInferenceState>,
-    outputs: BTreeMap<u32, BTreeMap<usize, Sam2FrameOutput>>,
+    outputs: BTreeMap<u32, BTreeMap<usize, StoredVideoOutput>>,
+}
+
+/// Minimal per-object/frame output retained for later interactive edits.
+/// High-resolution masks and conditioned image features are intentionally not
+/// kept for every propagated frame; the reference state stores only the
+/// low-resolution prediction and temporal-memory inputs needed for reuse.
+#[derive(Clone, Debug)]
+pub struct StoredVideoOutput {
+    pub low_res_masks: Tensor,
+    pub object_score_logits: Tensor,
+    pub object_pointer: Tensor,
 }
 
 impl InteractiveVideoSession {
@@ -228,7 +513,7 @@ impl InteractiveVideoSession {
         &self.state
     }
 
-    pub fn output(&self, object_id: u32, frame_index: usize) -> Option<&Sam2FrameOutput> {
+    pub fn output(&self, object_id: u32, frame_index: usize) -> Option<&StoredVideoOutput> {
         self.outputs
             .get(&object_id)
             .and_then(|outputs| outputs.get(&frame_index))
@@ -240,6 +525,17 @@ pub struct InteractiveVideoOutput {
     pub frame_index: usize,
     pub object_ids: Vec<u32>,
     pub masks: Tensor,
+}
+
+/// Synchronized broad-stage attribution for one video propagation. This is
+/// intentionally separate from the hot path so ordinary inference does not
+/// read clocks or add per-frame synchronizations.
+#[derive(Clone, Debug, Default)]
+pub struct VideoPropagationProfile {
+    pub preflight_ms: f64,
+    pub image_encoder_ms: Vec<f64>,
+    pub temporal_and_heads_ms: Vec<f64>,
+    pub restore_masks_ms: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -594,20 +890,42 @@ impl Sam2InteractiveVideoPredictor {
         }
         let transforms = Sam2ImageTransforms::default();
         let device = self.model.device();
-        let frames = images
-            .iter()
-            .map(|&(pixels, frame_width, frame_height)| {
-                Ok(transforms
-                    .prepare_rgb8(pixels, frame_width, frame_height, device)?
-                    .tensor)
-            })
+        let profile = std::env::var_os("SAM2_PROFILE_VIDEO_STAGES").is_some();
+        if profile {
+            device.synchronize()?;
+        }
+        let transform_start = Instant::now();
+        let (frames_batch, _) = transforms.forward_batch(images, device)?;
+        if profile {
+            device.synchronize()?;
+            eprintln!(
+                "SAM2_VIDEO_INIT_RS stage=transform frames={} ms={:.6}",
+                images.len(),
+                transform_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        let frames = (0..images.len())
+            .map(|index| frames_batch.narrow(0, index, 1))
             .collect::<Result<Vec<_>>>()?;
-        Ok(InteractiveVideoSession {
+        let mut session = InteractiveVideoSession {
             frames,
             state: VideoInferenceState::with_video(width, height, images.len())?,
             model_states: BTreeMap::new(),
             outputs: BTreeMap::new(),
-        })
+        };
+        // Match the reference predictor's init_state boundary: warm the
+        // backbone and retain frame zero for the first interaction.
+        let feature_start = Instant::now();
+        let _ = self.image_feature(&mut session, 0)?;
+        if profile {
+            device.synchronize()?;
+            eprintln!(
+                "SAM2_VIDEO_INIT_RS stage=frame_zero_feature frames={} ms={:.6}",
+                images.len(),
+                feature_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        Ok(session)
     }
 
     /// Initializes a session from already decoded owned frames.
@@ -641,12 +959,14 @@ impl Sam2InteractiveVideoPredictor {
                     .tensor)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(InteractiveVideoSession {
+        let mut session = InteractiveVideoSession {
             frames,
             state: VideoInferenceState::with_video(width, height, num_frames)?,
             model_states: BTreeMap::new(),
             outputs: BTreeMap::new(),
-        })
+        };
+        let _ = self.image_feature(&mut session, 0)?;
+        Ok(session)
     }
 
     /// Decodes a numerically named JPEG directory and initializes a session.
@@ -674,6 +994,14 @@ impl Sam2InteractiveVideoPredictor {
             memory_pos_enc: output.memory_pos_enc.clone(),
             object_pointer: output.object_pointer.clone(),
             low_res_mask_logits: output.low_res_masks.clone(),
+        }
+    }
+
+    fn stored_output(output: &Sam2FrameOutput) -> StoredVideoOutput {
+        StoredVideoOutput {
+            low_res_masks: output.low_res_masks.clone(),
+            object_score_logits: output.object_score_logits.clone(),
+            object_pointer: output.object_pointer.clone(),
         }
     }
 
@@ -816,7 +1144,7 @@ impl Sam2InteractiveVideoPredictor {
             .map(|output| output.low_res_masks.clamp(-32., 32.))
             .transpose()?;
         let feature = self.image_feature(session, frame_index)?;
-        let output = self.postprocess_output(self.model.track_backbone_with_mask_prompt(
+        let output = self.postprocess_output(self.model.track_backbone_with_deferred_memory(
             &feature,
             frame_index,
             conditioning,
@@ -836,7 +1164,7 @@ impl Sam2InteractiveVideoPredictor {
             .outputs
             .entry(object_id)
             .or_default()
-            .insert(frame_index, output.clone());
+            .insert(frame_index, Self::stored_output(&output));
         let object = session.state.object_mut(object_id);
         if conditioning {
             object
@@ -896,20 +1224,19 @@ impl Sam2InteractiveVideoPredictor {
             .to_dtype(DType::F32)?;
         session.state.add_mask(object_id, frame_index, mask);
         let feature = self.image_feature(session, frame_index)?;
-        let output = self.postprocess_output(self.model.track_mask_from_backbone(
-            &feature,
-            &model_mask,
-            frame_index,
-            true,
-            session.model_states.entry(object_id).or_default(),
-            false,
-            Some(session.frames.len()),
-        )?)?;
+        let output =
+            self.postprocess_output(self.model.track_mask_from_backbone_deferred_memory(
+                &feature,
+                &model_mask,
+                frame_index,
+                true,
+                session.model_states.entry(object_id).or_default(),
+            )?)?;
         session
             .outputs
             .entry(object_id)
             .or_default()
-            .insert(frame_index, output.clone());
+            .insert(frame_index, Self::stored_output(&output));
         session
             .state
             .object_mut(object_id)
@@ -953,18 +1280,13 @@ impl Sam2InteractiveVideoPredictor {
                     &output.object_pointer,
                     true,
                 )?;
-                // The reference compacts temporal memory to bfloat16 on the
-                // storage device. Convert back to f32 for Candle's homogeneous
-                // attention ops while preserving the same quantized values.
-                memory.memory_features = memory
-                    .memory_features
-                    .to_dtype(DType::BF16)?
-                    .to_dtype(DType::F32)?;
+                // Upstream SAM2VideoPredictor stores temporal features as
+                // BF16 on CPU as well as CUDA. Attention promotes only the
+                // selected frames back to the active compute dtype.
+                memory.memory_features = memory.memory_features.to_dtype(DType::BF16)?;
                 if let Some(position) = cached_memory_pos.as_ref() {
                     memory.memory_pos_enc = position.clone();
                 }
-                output.memory_features = memory.memory_features.clone();
-                output.memory_pos_enc = memory.memory_pos_enc.clone();
                 if cached_memory_pos.is_none() {
                     session
                         .state
@@ -1040,11 +1362,13 @@ impl Sam2InteractiveVideoPredictor {
                     .unwrap()
                     .conditioning_outputs
                     .contains_key(&frame_index);
-                let output = if existing_conditioning {
-                    session.outputs[&object_id][&frame_index].clone()
+                let low_res_masks = if existing_conditioning {
+                    session.outputs[&object_id][&frame_index]
+                        .low_res_masks
+                        .clone()
                 } else {
                     let output =
-                        self.postprocess_output(self.model.track_backbone_with_mask_prompt(
+                        self.postprocess_output(self.model.track_backbone_with_compact_memory(
                             &feature,
                             frame_index,
                             false,
@@ -1065,16 +1389,16 @@ impl Sam2InteractiveVideoPredictor {
                         .outputs
                         .entry(object_id)
                         .or_default()
-                        .insert(frame_index, output.clone());
+                        .insert(frame_index, Self::stored_output(&output));
                     session
                         .state
                         .object_mut(object_id)
                         .non_conditioning_outputs
                         .insert(frame_index, Self::memory(&output));
-                    output
+                    output.low_res_masks
                 };
                 session.state.mark_tracked(object_id, frame_index, reverse);
-                masks.push(output.low_res_masks);
+                masks.push(low_res_masks);
             }
             let refs = masks.iter().collect::<Vec<_>>();
             let (width, height) = session.state.video_dimensions().unwrap();
@@ -1090,6 +1414,105 @@ impl Sam2InteractiveVideoPredictor {
             });
         }
         Ok(results)
+    }
+
+    /// Synchronized companion to [`Self::propagate_in_video`] for benchmark
+    /// attribution. Its additional synchronization makes its total unsuitable
+    /// as the headline latency measurement.
+    pub fn propagate_in_video_profiled(
+        &self,
+        session: &mut InteractiveVideoSession,
+        start_frame: Option<usize>,
+        maximum_frames: Option<usize>,
+        reverse: bool,
+    ) -> Result<(Vec<InteractiveVideoOutput>, VideoPropagationProfile)> {
+        let mut profile = VideoPropagationProfile::default();
+        self.model.device().synchronize()?;
+        let start = Instant::now();
+        self.propagate_in_video_preflight(session)?;
+        self.model.device().synchronize()?;
+        profile.preflight_ms = start.elapsed().as_secs_f64() * 1000.;
+        let order = session
+            .state
+            .propagation_order(start_frame, maximum_frames, reverse)?;
+        let object_ids = session.state.object_ids().to_vec();
+        let mut results = Vec::with_capacity(order.len());
+        for frame_index in order {
+            let start = Instant::now();
+            let feature = self.image_feature(session, frame_index)?;
+            self.model.device().synchronize()?;
+            profile
+                .image_encoder_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+
+            let start = Instant::now();
+            let mut masks = Vec::with_capacity(object_ids.len());
+            for &object_id in &object_ids {
+                let existing_conditioning = session
+                    .state
+                    .object(object_id)
+                    .unwrap()
+                    .conditioning_outputs
+                    .contains_key(&frame_index);
+                let low_res_masks = if existing_conditioning {
+                    session.outputs[&object_id][&frame_index]
+                        .low_res_masks
+                        .clone()
+                } else {
+                    let output =
+                        self.postprocess_output(self.model.track_backbone_with_compact_memory(
+                            &feature,
+                            frame_index,
+                            false,
+                            session.model_states.get_mut(&object_id).unwrap(),
+                            &[],
+                            None,
+                            None,
+                            false,
+                            true,
+                            reverse,
+                            Some(session.frames.len()),
+                        )?)?;
+                    session
+                        .outputs
+                        .entry(object_id)
+                        .or_default()
+                        .insert(frame_index, Self::stored_output(&output));
+                    session
+                        .state
+                        .object_mut(object_id)
+                        .non_conditioning_outputs
+                        .insert(frame_index, Self::memory(&output));
+                    output.low_res_masks
+                };
+                session.state.mark_tracked(object_id, frame_index, reverse);
+                masks.push(low_res_masks);
+            }
+            self.model.device().synchronize()?;
+            profile
+                .temporal_and_heads_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+
+            let start = Instant::now();
+            let refs = masks.iter().collect::<Vec<_>>();
+            let (width, height) = session.state.video_dimensions().unwrap();
+            let masks = restore_video_masks(
+                &Tensor::cat(&refs, 0)?,
+                height,
+                width,
+                self.config.non_overlapping_masks,
+            )?;
+            self.model.device().synchronize()?;
+            profile
+                .restore_masks_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+            results.push(InteractiveVideoOutput {
+                frame_index,
+                object_ids: object_ids.clone(),
+                masks,
+            });
+        }
+        Ok((results, profile))
     }
 
     pub fn clear_all_prompts_in_frame(
@@ -1225,6 +1648,7 @@ impl Sam2ImagePredictor {
         if device.is_cpu() {
             crate::cpu_allocator::configure_cpu_allocator_for_inference();
         }
+        crate::cuda_allocator::configure_cuda_allocator_for_inference(device)?;
         crate::checkpoint::validate_sam2_1(path.as_ref(), variant)?;
         let vb = crate::checkpoint::load_var_builder(path, DType::F32, device)?;
         let config = Sam2Config::sam2_1(variant);
@@ -1440,11 +1864,25 @@ impl Sam2ImagePredictor {
             (None, None, None) => (None, None),
             _ => candle_core::bail!("point coordinates and labels must match"),
         };
+        let profile = std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some();
+        if profile {
+            self.device.synchronize()?;
+        }
+        let prompt_start = Instant::now();
         let prompt_embeddings = self.prompt_encoder.forward(
             coordinates.as_ref().zip(labels.as_ref()),
             None,
             mask_input,
         )?;
+        if profile {
+            self.device.synchronize()?;
+            eprintln!(
+                "SAM2_IMAGE_STAGE stage=prompt_encoder mask={} batch={} ms={:.6}",
+                mask_input.is_some(),
+                prompt_embeddings.sparse_embeddings.dim(0)?,
+                prompt_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
         let dense_pe = self.prompt_encoder.get_dense_pe()?;
         if let Some(high_res) = &features.sam_high_res_features {
             self.mask_decoder.forward_preprojected(
@@ -1474,16 +1912,8 @@ impl Sam2ImagePredictor {
         multimask_output: bool,
         return_logits: bool,
     ) -> Result<ImagePrediction> {
-        let (features, geometry) = self.cached_features(image_index)?;
-        let (coordinates, labels, boxes, mask) = self.prepare_cached_prompts(prompts, geometry)?;
-        let mut low_res = self.decode_prepared_cached(
-            &features,
-            coordinates.as_ref(),
-            labels.as_ref(),
-            boxes.as_ref(),
-            mask.as_ref(),
-            multimask_output,
-        )?;
+        let (mut low_res, geometry) =
+            self.decode_cached_index_raw(image_index, prompts, multimask_output)?;
         let masks = self.transforms.postprocess_masks(
             &low_res.masks,
             geometry.original_height,
@@ -1496,6 +1926,29 @@ impl Sam2ImagePredictor {
             masks.gt(self.transforms.mask_threshold())?
         };
         Ok(ImagePrediction { low_res, masks })
+    }
+
+    /// Runs cached prompt preparation and the decoder without restoring masks
+    /// to the source image. AMG mask-to-mask refinement consumes only these
+    /// native 256×256 logits, so restoring all initial candidates would create
+    /// a large result that is immediately discarded.
+    fn decode_cached_index_raw(
+        &self,
+        image_index: usize,
+        prompts: &ImagePromptBatch,
+        multimask_output: bool,
+    ) -> Result<(MaskDecoderOutput, ImageGeometry)> {
+        let (features, geometry) = self.cached_features(image_index)?;
+        let (coordinates, labels, boxes, mask) = self.prepare_cached_prompts(prompts, geometry)?;
+        let low_res = self.decode_prepared_cached(
+            &features,
+            coordinates.as_ref(),
+            labels.as_ref(),
+            boxes.as_ref(),
+            mask.as_ref(),
+            multimask_output,
+        )?;
+        Ok((low_res, geometry))
     }
 
     /// Predicts from a previously cached single image without rerunning Hiera.
@@ -1565,18 +2018,76 @@ impl Sam2ImagePredictor {
     /// Encodes an already-normalized image once. Reuse the returned features
     /// for multiple prompt decodes and for component-level performance probes.
     pub fn encode_image(&self, image: &Tensor) -> Result<BackboneOutput> {
-        let mut features = self.image_encoder.forward(image)?;
+        let mut features = if std::env::var_os("SAM2_PROFILE_IMAGE_STAGES").is_some() {
+            let (features, profile) = self.image_encoder.forward_profiled(image)?;
+            eprintln!(
+                "SAM2_IMAGE_ENCODER_RS hiera_setup_ms={:.6} hiera_blocks_ms={:?} \
+                 norm1_ms={:?} shortcut_ms={:?} shortcut_pool_ms={:?} partition_ms={:?} \
+                 attention_ms={:?} qkv_ms={:?} qkv_views_ms={:?} \
+                 query_pool_ms={:?} query_reshape_ms={:?} query_pool_core_ms={:?} \
+                 attention_kernel_ms={:?} attention_projection_ms={:?} \
+                 attention_cleanup_ms={:?} attention_cleanup_attended_ms={:?} \
+                 attention_cleanup_qkv_ms={:?} unpartition_ms={:?} residual_add_ms={:?} \
+                 norm2_ms={:?} mlp_ms={:?} mlp_expansion_ms={:?} \
+                 mlp_activation_ms={:?} mlp_projection_ms={:?} fpn_ms={:.6} \
+                 fpn_lateral_ms={:?} fpn_top_down_ms={:?} fpn_position_ms={:?}",
+                profile.hiera_setup_ms,
+                profile.hiera_block_ms,
+                profile.hiera_norm1_ms,
+                profile.hiera_shortcut_ms,
+                profile.hiera_shortcut_pool_ms,
+                profile.hiera_partition_ms,
+                profile.hiera_attention_ms,
+                profile.hiera_attention_qkv_ms,
+                profile.hiera_attention_qkv_views_ms,
+                profile.hiera_attention_query_pool_ms,
+                profile.hiera_attention_query_reshape_ms,
+                profile.hiera_attention_query_pool_core_ms,
+                profile.hiera_attention_kernel_ms,
+                profile.hiera_attention_projection_ms,
+                profile.hiera_attention_cleanup_ms,
+                profile.hiera_attention_cleanup_attended_ms,
+                profile.hiera_attention_cleanup_qkv_ms,
+                profile.hiera_unpartition_ms,
+                profile.hiera_residual_add_ms,
+                profile.hiera_norm2_ms,
+                profile.hiera_mlp_ms,
+                profile.hiera_mlp_expansion_ms,
+                profile.hiera_mlp_activation_ms,
+                profile.hiera_mlp_projection_ms,
+                profile.fpn_ms,
+                profile.fpn_lateral_ms,
+                profile.fpn_top_down_ms,
+                profile.fpn_position_ms,
+            );
+            features
+        } else {
+            self.image_encoder.forward(image)?
+        };
         features.vision_features = features
             .vision_features
             .broadcast_add(&self.no_mem_embed.reshape((1, 256usize, 1usize, 1usize))?)?;
-        if self.device.is_cpu()
-            && std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
+        // The upstream image predictor caches both high-resolution skip
+        // projections with the image embedding. This matters most on CUDA,
+        // where repeated prompt decoding must not relaunch the two convolutions.
+        // Preserve the CPU attribution escape hatch used by existing probes.
+        if !self.device.is_cpu()
+            || std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
                 .is_none_or(|value| value != "0")
         {
+            let profile_skip = std::env::var_os("SAM2_PROFILE_IMAGE_STAGES").is_some();
+            let profile_start = profile_skip.then(std::time::Instant::now);
             features.sam_high_res_features = Some(
                 self.mask_decoder
                     .project_high_res_features(&features.backbone_fpn[..2])?,
             );
+            if let Some(start) = profile_start {
+                self.device.synchronize()?;
+                eprintln!(
+                    "SAM2_IMAGE_ENCODER_RS skip_projection_ms={:.6}",
+                    start.elapsed().as_secs_f64() * 1000.
+                );
+            }
         }
         Ok(features)
     }
@@ -1587,8 +2098,8 @@ impl Sam2ImagePredictor {
         image: &Tensor,
     ) -> Result<(BackboneOutput, ImageEncoderProfile)> {
         let (mut features, profile) = self.image_encoder.forward_profiled(image)?;
-        if self.device.is_cpu()
-            && std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
+        if !self.device.is_cpu()
+            || std::env::var_os("SAM2_CPU_PREDICTOR_PREPROJECT_SKIPS")
                 .is_none_or(|value| value != "0")
         {
             features.sam_high_res_features = Some(
@@ -1686,6 +2197,53 @@ impl Sam2ImagePredictor {
                 &features.backbone_fpn[..2],
             )
         }
+    }
+
+    /// Decodes several prompt sets against one already encoded image. Point
+    /// coordinates and boxes are in the model's 1024×1024 coordinate space;
+    /// the leading dimension is the prompt batch.
+    pub fn decode_image_features_batch(
+        &self,
+        features: &BackboneOutput,
+        prompts: &ImagePromptBatch,
+        multimask_output: bool,
+    ) -> Result<MaskDecoderOutput> {
+        if prompts.normalize_coords {
+            candle_core::bail!(
+                "decode_image_features_batch expects model-space coordinates; use predict_cached for original-space prompts"
+            )
+        }
+        let coordinates = prompts
+            .point_coords
+            .as_ref()
+            .map(|value| value.to_device(&self.device))
+            .transpose()?;
+        let labels = prompts
+            .point_labels
+            .as_ref()
+            .map(|value| value.to_device(&self.device))
+            .transpose()?;
+        if coordinates.is_some() != labels.is_some() {
+            candle_core::bail!("point coordinates and labels must be supplied together")
+        }
+        let boxes = prompts
+            .boxes
+            .as_ref()
+            .map(|value| value.to_device(&self.device))
+            .transpose()?;
+        let mask = prompts
+            .mask_input
+            .as_ref()
+            .map(|value| value.to_dtype(DType::F32)?.to_device(&self.device))
+            .transpose()?;
+        self.decode_prepared_cached(
+            features,
+            coordinates.as_ref(),
+            labels.as_ref(),
+            boxes.as_ref(),
+            mask.as_ref(),
+            multimask_output,
+        )
     }
 
     /// Decoder-only companion to [`Self::decode_image_features`] for stable
@@ -1806,9 +2364,34 @@ impl Sam2AutomaticMaskGenerator {
         Self::load_sam2_1(variant, path, config)
     }
 
+    /// Downloads the published checkpoint and constructs the automatic mask
+    /// generator on `device`.
+    #[cfg(feature = "huggingface")]
+    pub fn from_pretrained_on_device(
+        variant: Sam2Variant,
+        device: &Device,
+        config: AutomaticMaskConfig,
+    ) -> Result<Self> {
+        let path = crate::download_checkpoint(variant)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        Self::load_sam2_1_on_device(variant, path, device, config)
+    }
+
     pub fn load_sam2_1(
         variant: Sam2Variant,
         path: impl AsRef<Path>,
+        config: AutomaticMaskConfig,
+    ) -> Result<Self> {
+        Self::load_sam2_1_on_device(variant, path, &Device::Cpu, config)
+    }
+
+    /// Loads the generator onto `device`. Automatic-mask metadata and RLE
+    /// construction remain on the host, while image and prompt inference use
+    /// the selected backend.
+    pub fn load_sam2_1_on_device(
+        variant: Sam2Variant,
+        path: impl AsRef<Path>,
+        device: &Device,
         config: AutomaticMaskConfig,
     ) -> Result<Self> {
         config.validate()?;
@@ -1816,7 +2399,7 @@ impl Sam2AutomaticMaskGenerator {
             predictor: Sam2ImagePredictor::load_sam2_1_on_device_with_config(
                 variant,
                 path,
-                &Device::Cpu,
+                device,
                 ImagePredictorConfig {
                     max_hole_area: config.min_mask_region_area,
                     max_sprinkle_area: config.min_mask_region_area,
@@ -1894,6 +2477,7 @@ impl Sam2AutomaticMaskGenerator {
         crop: [usize; 4],
         grid: &[[f32; 2]],
     ) -> Result<Vec<AutomaticMaskCandidate>> {
+        let profile = std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some();
         let [x0, y0, x1, y1] = crop;
         let crop_width = x1 - x0;
         let crop_height = y1 - y0;
@@ -1902,7 +2486,18 @@ impl Sam2AutomaticMaskGenerator {
             let start = (y * original_width + x0) * 3;
             pixels.extend_from_slice(&image[start..start + crop_width * 3]);
         }
+        if profile {
+            predictor.device().synchronize()?;
+        }
+        let encode_start = Instant::now();
         predictor.set_image(&pixels, crop_width, crop_height)?;
+        if profile {
+            predictor.device().synchronize()?;
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=image_encoder ms={:.6}",
+                encode_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
         let points = grid
             .iter()
             .map(|point| [point[0] * crop_width as f32, point[1] * crop_height as f32])
@@ -1933,112 +2528,546 @@ impl Sam2AutomaticMaskGenerator {
         original_width: usize,
         original_height: usize,
     ) -> Result<Vec<AutomaticMaskCandidate>> {
+        let profile = std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some();
         let point_values = points.iter().flatten().copied().collect::<Vec<_>>();
         let point_tensor =
             Tensor::from_vec(point_values, (points.len(), 1, 2), predictor.device())?;
         let labels = Tensor::ones((points.len(), 1), DType::I64, predictor.device())?;
-        let initial = predictor.predict_cached(
-            &ImagePromptBatch {
-                point_coords: Some(point_tensor.clone()),
-                point_labels: Some(labels.clone()),
-                normalize_coords: true,
-                ..Default::default()
-            },
-            self.config.multimask_output,
-            true,
-        )?;
-        let (masks, ious, point_indices) = if self.config.use_m2m {
-            let masks_per_point = initial.low_res.masks.dim(1)?;
+        if profile {
+            predictor.device().synchronize()?;
+        }
+        let initial_start = Instant::now();
+        let prompts = ImagePromptBatch {
+            point_coords: Some(point_tensor.clone()),
+            point_labels: Some(labels.clone()),
+            normalize_coords: true,
+            ..Default::default()
+        };
+        let (initial_low_res, initial_geometry) =
+            predictor.decode_cached_index_raw(0, &prompts, self.config.multimask_output)?;
+        if std::env::var_os("SAM2_PROFILE_A2_BOUNDARY").is_some() {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let batch_index = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
+            if !self.config.use_m2m
+                && batch_index == 2
+                && initial_low_res.masks.dim(0).is_ok_and(|count| count > 18)
+            {
+                let restored = predictor.transforms.postprocess_masks(
+                    &initial_low_res.masks,
+                    initial_geometry.original_height,
+                    initial_geometry.original_width,
+                )?;
+                let logits = restored
+                    .narrow(0, 18, 1)?
+                    .narrow(2, 79, 1)?
+                    .narrow(3, 495, 1)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                let ious = initial_low_res
+                    .iou_predictions
+                    .narrow(0, 18, 1)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                let low_res = initial_low_res
+                    .masks
+                    .narrow(0, 18, 1)?
+                    .narrow(1, 1, 1)?
+                    .narrow(2, 37, 2)?
+                    .narrow(3, 158, 2)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                // Multimask output index 1 is internal mask token 2. Capture
+                // both 32-wide projection operands at the four contributing
+                // native mask pixels to match the Python A2 diagnostic.
+                let mask_token2 = initial_low_res
+                    .mask_tokens
+                    .narrow(0, 18, 1)?
+                    .narrow(1, 1, 1)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                let hyper_token2 = initial_low_res
+                    .hyper_in
+                    .narrow(0, 18, 1)?
+                    .narrow(1, 2, 1)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                let upscaled = initial_low_res
+                    .upscaled_embedding
+                    .narrow(0, 18, 1)?
+                    .narrow(2, 37, 2)?
+                    .narrow(3, 158, 2)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                eprintln!(
+                    "SAM2_A2_BOUNDARY_RS batch={batch_index} logits={logits:?} \
+                     ious={ious:?} low_res_y37_38_x158_159={low_res:?} \
+                     mask_token2={mask_token2:?} \
+                     hyper_token2={hyper_token2:?} \
+                     upscaled_y37_38_x158_159={upscaled:?}"
+                );
+            }
+        }
+        if profile {
+            predictor.device().synchronize()?;
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=initial_decoder ms={:.6}",
+                initial_start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        let (masks, ious, stability_scores, point_indices) = if self.config.use_m2m {
+            // Match the public predictor's low-resolution return contract
+            // before feeding these logits back as a refinement prompt. Move
+            // out only the masks so the unused upscaled embedding, token
+            // projections, and score tensors drop before refinement starts.
+            let MaskDecoderOutput {
+                masks: initial_low_res_masks,
+                iou_predictions,
+                mask_tokens,
+                object_score_logits,
+                upscaled_embedding,
+                hyper_in,
+            } = initial_low_res;
+            drop((
+                iou_predictions,
+                mask_tokens,
+                object_score_logits,
+                upscaled_embedding,
+                hyper_in,
+            ));
+            let initial_low_res_masks = initial_low_res_masks.clamp(-32., 32.)?;
+            let masks_per_point = initial_low_res_masks.dim(1)?;
             let count = points.len() * masks_per_point;
             let repeated_points = point_tensor
                 .broadcast_as((points.len(), masks_per_point, 2))?
                 .reshape((count, 1, 2))?;
-            let refined = predictor.predict_cached(
-                &ImagePromptBatch {
-                    point_coords: Some(repeated_points),
-                    point_labels: Some(Tensor::ones((count, 1), DType::I64, predictor.device())?),
-                    mask_input: Some(initial.low_res.masks.reshape((count, 1, 256, 256))?),
-                    normalize_coords: true,
-                    ..Default::default()
-                },
-                false,
-                true,
-            )?;
-            (
-                refined.masks,
-                refined.low_res.iou_predictions,
-                (0..count)
+            let low_res_masks = initial_low_res_masks.reshape((count, 1, 256, 256))?;
+            // Preserve the upstream batch bound: one initial point can yield
+            // three candidates, so refining all candidates in one call would
+            // silently triple the configured decoder batch and its GPU working
+            // set.
+            let mut refined_masks = Vec::new();
+            let mut kept_ious = Vec::new();
+            let mut kept_stability = Vec::new();
+            let mut kept_point_indices = Vec::new();
+            let mut refine_ms = 0.;
+            for range in batch_ranges(count, self.config.points_per_batch)? {
+                let batch_len = range.end - range.start;
+                if profile {
+                    predictor.device().synchronize()?;
+                }
+                let refine_start = Instant::now();
+                let (refined, geometry) = predictor.decode_cached_index_raw(
+                    0,
+                    &ImagePromptBatch {
+                        point_coords: Some(repeated_points.narrow(0, range.start, batch_len)?),
+                        point_labels: Some(Tensor::ones(
+                            (batch_len, 1),
+                            DType::I64,
+                            predictor.device(),
+                        )?),
+                        mask_input: Some(low_res_masks.narrow(0, range.start, batch_len)?),
+                        normalize_coords: true,
+                        ..Default::default()
+                    },
+                    false,
+                )?;
+                if profile {
+                    predictor.device().synchronize()?;
+                    refine_ms += refine_start.elapsed().as_secs_f64() * 1000.;
+                }
+                let batch_point_indices = (range.start..range.end)
                     .map(|index| index / masks_per_point)
-                    .collect::<Vec<_>>(),
+                    .collect::<Vec<_>>();
+                let MaskDecoderOutput {
+                    masks: refined_low_res_masks,
+                    iou_predictions,
+                    mask_tokens,
+                    object_score_logits,
+                    upscaled_embedding,
+                    hyper_in,
+                } = refined;
+                drop((
+                    mask_tokens,
+                    object_score_logits,
+                    upscaled_embedding,
+                    hyper_in,
+                ));
+                let (masks, ious, stability, point_indices) = filter_amg_low_res_quality_on_device(
+                    refined_low_res_masks,
+                    iou_predictions,
+                    batch_point_indices,
+                    geometry,
+                    &predictor.transforms,
+                    &self.config,
+                )?;
+                refined_masks.push(masks);
+                kept_ious.extend(ious);
+                kept_stability.extend(stability);
+                kept_point_indices.extend(point_indices);
+            }
+            if profile {
+                eprintln!("SAM2_AMG_STAGE_RS stage=refine_decoder ms={:.6}", refine_ms);
+            }
+            let mask_refs = refined_masks.iter().collect::<Vec<_>>();
+            (
+                Tensor::cat(&mask_refs, 0)?,
+                kept_ious,
+                kept_stability,
+                kept_point_indices,
             )
         } else {
-            let masks_per_point = initial.masks.dim(1)?;
+            let masks_per_point = initial_low_res.masks.dim(1)?;
             let count = points.len() * masks_per_point;
-            (
-                initial
-                    .masks
-                    .reshape((count, 1, crop[3] - crop[1], crop[2] - crop[0]))?,
-                initial.low_res.iou_predictions.reshape(count)?,
+            filter_amg_low_res_quality_on_device(
+                initial_low_res.masks.reshape((count, 1, 256, 256))?,
+                initial_low_res.iou_predictions.reshape(count)?,
                 (0..count)
                     .map(|index| index / masks_per_point)
                     .collect::<Vec<_>>(),
-            )
+                initial_geometry,
+                &predictor.transforms,
+                &self.config,
+            )?
         };
-        let masks = masks
-            .to_device(&Device::Cpu)?
-            .to_dtype(DType::F32)?
-            .squeeze(1)?
-            .to_vec3::<f32>()?;
-        let ious = ious
-            .flatten_all()?
-            .to_device(&Device::Cpu)?
-            .to_vec1::<f32>()?;
-        let mut output = Vec::new();
-        for (index, mask) in masks.iter().enumerate() {
-            let iou = ious[index];
-            if self.config.pred_iou_thresh > 0. && iou <= self.config.pred_iou_thresh {
-                continue;
-            }
-            let stability = stability_score(
-                mask,
-                self.config.mask_threshold,
-                self.config.stability_score_offset,
+        if profile {
+            predictor.device().synchronize()?;
+        }
+        let postprocess_start = Instant::now();
+        let mask_width = crop[2] - crop[0];
+        let mask_height = crop[3] - crop[1];
+        let pixels_per_mask = mask_width * mask_height;
+        let transfer_start = Instant::now();
+        #[cfg(feature = "cuda")]
+        let packed_masks = if masks.device().is_cuda()
+            && masks.dtype() == DType::F32
+            && std::env::var_os("SAM2_CUDA_PACK_AMG_MASKS").is_none_or(|value| value != "0")
+        {
+            Some(
+                masks
+                    .apply_op1_no_bwd(&CudaThresholdPack {
+                        threshold: self.config.mask_threshold as f32,
+                    })?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<u32>()?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let packed_masks: Option<Vec<u32>> = None;
+        let byte_masks = if packed_masks.is_none() {
+            masks
+                .gt(self.config.mask_threshold as f64)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<u8>()?
+        } else {
+            Vec::new()
+        };
+        if profile {
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=threshold_transfer ms={:.6}",
+                transfer_start.elapsed().as_secs_f64() * 1000.
             );
-            if self.config.stability_score_thresh > 0.
-                && stability < self.config.stability_score_thresh
-            {
-                continue;
-            }
-            let Some((local_rle, local_box, _)) = binary_mask_metadata(
-                mask,
-                crop[2] - crop[0],
-                crop[3] - crop[1],
-                self.config.mask_threshold,
-            ) else {
-                continue;
-            };
-            if box_near_crop_edge(local_box, crop, original_width, original_height, 20.) {
-                continue;
-            }
-            let rle = uncrop_rle(&local_rle, crop, original_height, original_width)?;
-            let global_box = [
-                local_box[0] + crop[0] as f32,
-                local_box[1] + crop[1] as f32,
-                local_box[2] + crop[0] as f32,
-                local_box[3] + crop[1] as f32,
-            ];
-            let point = points[point_indices[index]];
-            output.push(AutomaticMaskCandidate {
-                rle,
-                box_xyxy: global_box,
-                crop_box: crop.map(|value| value as f32),
-                predicted_iou: iou,
-                point: [point[0] + crop[0] as f32, point[1] + crop[1] as f32],
-                stability_score: stability,
-            });
+        }
+        let words_per_mask = pixels_per_mask.div_ceil(32);
+        let metadata_start = Instant::now();
+        let candidates = (0..ious.len())
+            .into_par_iter()
+            .map(|index| -> Result<Option<AutomaticMaskCandidate>> {
+                let metadata = if let Some(packed_masks) = &packed_masks {
+                    let mask = &packed_masks[index * words_per_mask..(index + 1) * words_per_mask];
+                    packed_binary_mask_metadata_flat(mask, mask_width, mask_height)
+                } else {
+                    let mask = &byte_masks[index * pixels_per_mask..(index + 1) * pixels_per_mask];
+                    binary_mask_metadata_flat(mask, mask_width, mask_height)
+                };
+                let Some((local_rle, local_box, _)) = metadata else {
+                    return Ok(None);
+                };
+                if box_near_crop_edge(local_box, crop, original_width, original_height, 20.) {
+                    return Ok(None);
+                }
+                let rle = uncrop_rle(&local_rle, crop, original_height, original_width)?;
+                let global_box = [
+                    local_box[0] + crop[0] as f32,
+                    local_box[1] + crop[1] as f32,
+                    local_box[2] + crop[0] as f32,
+                    local_box[3] + crop[1] as f32,
+                ];
+                let point = points[point_indices[index]];
+                Ok(Some(AutomaticMaskCandidate {
+                    rle,
+                    box_xyxy: global_box,
+                    crop_box: crop.map(|value| value as f32),
+                    predicted_iou: ious[index],
+                    point: [point[0] + crop[0] as f32, point[1] + crop[1] as f32],
+                    stability_score: stability_scores[index],
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output = candidates.into_iter().flatten().collect::<Vec<_>>();
+        if profile {
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=metadata_rle ms={:.6}",
+                metadata_start.elapsed().as_secs_f64() * 1000.
+            );
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=transfer_filter_rle ms={:.6}",
+                postprocess_start.elapsed().as_secs_f64() * 1000.
+            );
         }
         Ok(output)
     }
+}
+
+/// Applies the AMG IoU gate while masks are still at the decoder's native
+/// resolution, then restores only surviving masks before computing the
+/// full-resolution stability score. IoU is independent of mask restoration,
+/// and postprocessing operates independently per mask, so this preserves the
+/// reference ordering and values while avoiding discarded interpolations.
+fn filter_amg_low_res_quality_on_device(
+    low_res_masks: Tensor,
+    ious: Tensor,
+    point_indices: Vec<usize>,
+    geometry: ImageGeometry,
+    transforms: &Sam2ImageTransforms,
+    config: &AutomaticMaskConfig,
+) -> Result<(Tensor, Vec<f32>, Vec<f32>, Vec<usize>)> {
+    let profile = std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some();
+    let profile_device = low_res_masks.device().clone();
+    if profile {
+        profile_device.synchronize()?;
+    }
+    let mut profile_start = Instant::now();
+    macro_rules! profile_quality_stage {
+        ($name:expr) => {
+            if profile {
+                profile_device.synchronize()?;
+                eprintln!(
+                    "SAM2_AMG_QUALITY_STAGE stage={} ms={:.6}",
+                    $name,
+                    profile_start.elapsed().as_secs_f64() * 1000.
+                );
+                profile_start = Instant::now();
+            }
+        };
+    }
+    let host_ious = ious
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<f32>()?;
+    if host_ious.len() != point_indices.len() {
+        candle_core::bail!("AMG mask, score, and point counts differ")
+    }
+    let keep_iou = host_ious
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &iou)| {
+            (config.pred_iou_thresh <= 0. || iou > config.pred_iou_thresh).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    profile_quality_stage!("iou_transfer_and_filter");
+    if keep_iou.is_empty() {
+        if std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some() {
+            eprintln!(
+                "SAM2_AMG_STAGE_RS stage=quality_counts input={} iou=0 final=0",
+                point_indices.len()
+            );
+        }
+        return Ok((
+            Tensor::zeros(
+                (0, 1, geometry.original_height, geometry.original_width),
+                DType::F32,
+                low_res_masks.device(),
+            )?,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    let selected_low_res = if keep_iou.len() == point_indices.len() {
+        low_res_masks
+    } else {
+        let indices = Tensor::from_vec(
+            keep_iou
+                .iter()
+                .map(|&index| index as u32)
+                .collect::<Vec<_>>(),
+            keep_iou.len(),
+            low_res_masks.device(),
+        )?;
+        low_res_masks.index_select(&indices, 0)?
+    };
+    profile_quality_stage!("select_iou_masks");
+    let direct_stability = if selected_low_res.device().is_cpu()
+        && selected_low_res.dtype() == DType::F32
+        && !transforms.has_mask_cleanup()
+        && std::env::var_os("SAM2_CPU_FUSED_AMG_STABILITY").is_none_or(|value| value != "0")
+    {
+        let counts = selected_low_res
+            .apply_op1_no_bwd(&CpuBilinearStabilityCounts {
+                output_height: geometry.original_height,
+                output_width: geometry.original_width,
+                high_threshold: config.mask_threshold + config.stability_score_offset,
+                low_threshold: config.mask_threshold - config.stability_score_offset,
+            })?
+            .flatten_all()?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<u32>()?;
+        Some(
+            counts
+                .chunks_exact(2)
+                .map(|pair| pair[0] as f32 / pair[1] as f32)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        #[cfg(feature = "cuda")]
+        {
+            if selected_low_res.device().is_cuda()
+                && !transforms.has_mask_cleanup()
+                && std::env::var_os("SAM2_CUDA_FUSED_AMG_STABILITY")
+                    .is_none_or(|value| value != "0")
+            {
+                let counts = selected_low_res
+                    .apply_op1_no_bwd(&CudaBilinearStabilityCounts {
+                        output_height: geometry.original_height,
+                        output_width: geometry.original_width,
+                        high_threshold: config.mask_threshold + config.stability_score_offset,
+                        low_threshold: config.mask_threshold - config.stability_score_offset,
+                    })?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<u32>()?;
+                Some(
+                    counts
+                        .chunks_exact(2)
+                        .map(|pair| pair[0] as f32 / pair[1] as f32)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    };
+    if direct_stability.is_some() {
+        profile_quality_stage!("direct_stability_counts");
+    }
+    let (restored, stability) = if let Some(stability) = direct_stability {
+        (None, stability)
+    } else {
+        let restored = transforms.postprocess_masks(
+            &selected_low_res,
+            geometry.original_height,
+            geometry.original_width,
+        )?;
+        profile_quality_stage!("restore_iou_masks");
+        let stability = calculate_stability_score(
+            &restored,
+            config.mask_threshold as f64,
+            config.stability_score_offset as f64,
+        )?;
+        profile_quality_stage!("calculate_stability");
+        let stability = stability
+            .flatten_all()?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<f32>()?;
+        profile_quality_stage!("stability_transfer");
+        (Some(restored), stability)
+    };
+    if stability.len() != keep_iou.len() {
+        candle_core::bail!("AMG mask, score, and point counts differ")
+    }
+    let keep_stability = stability
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &score)| {
+            (config.stability_score_thresh <= 0. || score >= config.stability_score_thresh)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    profile_quality_stage!("filter_stability");
+    if std::env::var_os("SAM2_PROFILE_AMG_STAGES").is_some() {
+        eprintln!(
+            "SAM2_AMG_STAGE_RS stage=quality_counts input={} iou={} final={}",
+            point_indices.len(),
+            keep_iou.len(),
+            keep_stability.len()
+        );
+    }
+    let selected_masks = if keep_stability.is_empty() {
+        Tensor::zeros(
+            (0, 1, geometry.original_height, geometry.original_width),
+            DType::F32,
+            selected_low_res.device(),
+        )?
+    } else if let Some(restored) = restored {
+        if keep_stability.len() == keep_iou.len() {
+            restored
+        } else {
+            let indices = Tensor::from_vec(
+                keep_stability
+                    .iter()
+                    .map(|&index| index as u32)
+                    .collect::<Vec<_>>(),
+                keep_stability.len(),
+                restored.device(),
+            )?;
+            restored.index_select(&indices, 0)?
+        }
+    } else {
+        let indices = Tensor::from_vec(
+            keep_stability
+                .iter()
+                .map(|&index| index as u32)
+                .collect::<Vec<_>>(),
+            keep_stability.len(),
+            selected_low_res.device(),
+        )?;
+        let final_low_res = if keep_stability.len() == keep_iou.len() {
+            selected_low_res
+        } else {
+            selected_low_res.index_select(&indices, 0)?
+        };
+        transforms.postprocess_masks(
+            &final_low_res,
+            geometry.original_height,
+            geometry.original_width,
+        )?
+    };
+    if profile {
+        profile_device.synchronize()?;
+        eprintln!(
+            "SAM2_AMG_QUALITY_STAGE stage=select_final_masks ms={:.6}",
+            profile_start.elapsed().as_secs_f64() * 1000.
+        );
+    }
+    Ok((
+        selected_masks,
+        keep_stability
+            .iter()
+            .map(|&index| host_ious[keep_iou[index]])
+            .collect(),
+        keep_stability
+            .iter()
+            .map(|&index| stability[index])
+            .collect(),
+        keep_stability
+            .iter()
+            .map(|&index| point_indices[keep_iou[index]])
+            .collect(),
+    ))
 }
 
 impl AutomaticMaskConfig {
@@ -2120,36 +3149,23 @@ impl AutomaticMaskCandidate {
     }
 }
 
-fn stability_score(mask: &[Vec<f32>], threshold: f32, offset: f32) -> f32 {
-    let mut lower = 0usize;
-    let mut upper = 0usize;
-    for value in mask.iter().flatten() {
-        lower += usize::from(*value > threshold - offset);
-        upper += usize::from(*value > threshold + offset);
-    }
-    if lower == 0 {
-        1.
-    } else {
-        upper as f32 / lower as f32
-    }
-}
-
-fn binary_mask_metadata(
-    mask: &[Vec<f32>],
+fn binary_mask_metadata_flat(
+    mask: &[u8],
     width: usize,
     height: usize,
-    threshold: f32,
 ) -> Option<(MaskRle, [f32; 4], usize)> {
-    let mut binary = Vec::with_capacity(width * height);
     let mut area = 0usize;
     let mut min_x = width;
     let mut min_y = height;
     let mut max_x = 0usize;
     let mut max_y = 0usize;
-    for (y, row) in mask.iter().enumerate() {
-        for (x, value) in row.iter().enumerate() {
-            let foreground = *value > threshold;
-            binary.push(foreground);
+    let mut counts = Vec::new();
+    let mut current = false;
+    let mut run = 0usize;
+    for x in 0..width {
+        for y in 0..height {
+            let value = mask[y * width + x];
+            let foreground = value != 0;
             if foreground {
                 area += 1;
                 min_x = min_x.min(x);
@@ -2157,13 +3173,77 @@ fn binary_mask_metadata(
                 max_x = max_x.max(x);
                 max_y = max_y.max(y);
             }
+            if foreground == current {
+                run += 1;
+            } else {
+                counts.push(run);
+                run = 1;
+                current = foreground;
+            }
         }
     }
+    counts.push(run);
     if area == 0 {
         return None;
     }
     Some((
-        MaskRle::from_row_major_mask(&binary, width, height).expect("validated mask dimensions"),
+        MaskRle {
+            width,
+            height,
+            counts,
+        },
+        [min_x as f32, min_y as f32, max_x as f32, max_y as f32],
+        area,
+    ))
+}
+
+fn packed_binary_mask_metadata_flat(
+    mask: &[u32],
+    width: usize,
+    height: usize,
+) -> Option<(MaskRle, [f32; 4], usize)> {
+    let pixels = width * height;
+    if mask.len() != pixels.div_ceil(32) {
+        return None;
+    }
+    let mut area = 0usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut counts = Vec::new();
+    let mut current = false;
+    let mut run = 0usize;
+    for x in 0..width {
+        for y in 0..height {
+            let pixel = y * width + x;
+            let foreground = (mask[pixel / 32] >> (pixel % 32)) & 1 != 0;
+            if foreground {
+                area += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+            if foreground == current {
+                run += 1;
+            } else {
+                counts.push(run);
+                run = 1;
+                current = foreground;
+            }
+        }
+    }
+    counts.push(run);
+    if area == 0 {
+        return None;
+    }
+    Some((
+        MaskRle {
+            width,
+            height,
+            counts,
+        },
         [min_x as f32, min_y as f32, max_x as f32, max_y as f32],
         area,
     ))
@@ -2224,12 +3304,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fused_cpu_bilinear_stability_counts_match_composed_ops() -> Result<()> {
+        let input_height = 5;
+        let input_width = 7;
+        let output_height = 13;
+        let output_width = 19;
+        let values = (0..3 * input_height * input_width)
+            .map(|index| ((index * 37 % 101) as f32 - 50.) / 31.)
+            .collect::<Vec<_>>();
+        let masks = Tensor::from_vec(values, (3, 1, input_height, input_width), &Device::Cpu)?;
+        let high_threshold = 0.23f32;
+        let low_threshold = -0.17f32;
+        let expected = masks
+            .upsample_bilinear2d(output_height, output_width, false)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .chunks_exact(output_height * output_width)
+            .map(|mask| {
+                mask.iter().fold([0u32; 2], |mut counts, &value| {
+                    counts[0] += u32::from(value > high_threshold);
+                    counts[1] += u32::from(value > low_threshold);
+                    counts
+                })
+            })
+            .collect::<Vec<_>>();
+        let actual = masks
+            .apply_op1_no_bwd(&CpuBilinearStabilityCounts {
+                output_height,
+                output_width,
+                high_threshold,
+                low_threshold,
+            })?
+            .to_vec2::<u32>()?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn automatic_mask_metadata_is_coco_column_major_and_has_tight_box() {
-        let mask = vec![vec![-1., 1., 1.], vec![-1., -1., 1.]];
-        let (rle, bbox, area) = binary_mask_metadata(&mask, 3, 2, 0.).unwrap();
+        let mask = vec![0, 1, 1, 0, 0, 1];
+        let (rle, bbox, area) = binary_mask_metadata_flat(&mask, 3, 2).unwrap();
         assert_eq!(area, 3);
         assert_eq!(bbox, [1., 0., 2., 1.]);
         assert_eq!(rle.counts, vec![2, 1, 1, 2]);
+    }
+
+    #[test]
+    fn packed_automatic_mask_metadata_matches_byte_masks_across_word_boundaries() {
+        let width = 19;
+        let height = 3;
+        let mask = (0..width * height)
+            .map(|index| u8::from(index % 7 == 1 || index % 11 == 4))
+            .collect::<Vec<_>>();
+        let mut packed = vec![0u32; mask.len().div_ceil(32)];
+        for (index, &value) in mask.iter().enumerate() {
+            packed[index / 32] |= u32::from(value != 0) << (index % 32);
+        }
+        let byte_metadata = binary_mask_metadata_flat(&mask, width, height).unwrap();
+        let packed_metadata = packed_binary_mask_metadata_flat(&packed, width, height).unwrap();
+        assert_eq!(packed_metadata, byte_metadata);
     }
 
     #[test]

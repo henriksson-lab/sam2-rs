@@ -57,9 +57,22 @@ fn main() -> ExitCode {
         .position(|arg| arg == "--decoder-only")
         .map(|index| args.remove(index))
         .is_some();
+    let variant_name = args
+        .iter()
+        .position(|arg| arg == "--variant")
+        .map(|index| {
+            if index + 1 >= args.len() {
+                String::new()
+            } else {
+                let name = args.remove(index + 1);
+                args.remove(index);
+                name
+            }
+        })
+        .unwrap_or_else(|| "tiny".to_owned());
     if args.len() < 2 {
         eprintln!(
-            "usage: bench-static <checkpoint.safetensors> <fixture.safetensors> [iterations] [output.f32] [--device cpu|cuda] [--profile-stages] [--profile-encoder] [--profile-decoder] [--decoder-only]"
+            "usage: bench-static <checkpoint.safetensors> <fixture.safetensors> [iterations] [output.f32] [--device cpu|cuda] [--variant tiny|small|base-plus|large] [--profile-stages] [--profile-encoder] [--profile-decoder] [--decoder-only]"
         );
         return ExitCode::from(2);
     }
@@ -89,8 +102,14 @@ fn main() -> ExitCode {
             // events therefore provide no ordering that this path needs.
             unsafe { cuda.disable_event_tracking() };
         }
-        let predictor =
-            Sam2ImagePredictor::load_sam2_1_on_device(Sam2Variant::HieraTiny, &args[0], &device)?;
+        let variant = match variant_name.as_str() {
+            "tiny" => Sam2Variant::HieraTiny,
+            "small" => Sam2Variant::HieraSmall,
+            "base-plus" | "base_plus" => Sam2Variant::HieraBasePlus,
+            "large" => Sam2Variant::HieraLarge,
+            _ => candle_core::bail!("unsupported variant {variant_name:?}"),
+        };
+        let predictor = Sam2ImagePredictor::load_sam2_1_on_device(variant, &args[0], &device)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&args[1]], DType::F32, &device) }?;
         let image = vb.get((1, 3, 1024, 1024), "image")?;
         let point = PointPrompt {

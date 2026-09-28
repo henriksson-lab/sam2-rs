@@ -87,11 +87,26 @@ impl VideoInferenceState {
         self.mask_memory_position_encoding = None;
     }
 
-    pub fn insert_conditioning(&mut self, frame_index: usize, frame: MemoryFrame) {
+    fn reuse_memory_position_encoding(&mut self, frame: &mut MemoryFrame) {
+        if let Some(position) = self
+            .mask_memory_position_encoding
+            .as_ref()
+            .and_then(|positions| positions.first())
+            .filter(|position| position.dims() == frame.memory_pos_enc.dims())
+        {
+            frame.memory_pos_enc = position.clone();
+        } else {
+            self.mask_memory_position_encoding = Some(vec![frame.memory_pos_enc.clone()]);
+        }
+    }
+
+    pub fn insert_conditioning(&mut self, frame_index: usize, mut frame: MemoryFrame) {
+        self.reuse_memory_position_encoding(&mut frame);
         self.conditioning_frames.insert(frame_index, frame);
     }
 
-    pub fn insert_propagated(&mut self, frame_index: usize, frame: MemoryFrame) {
+    pub fn insert_propagated(&mut self, frame_index: usize, mut frame: MemoryFrame) {
+        self.reuse_memory_position_encoding(&mut frame);
         self.non_conditioning_frames.insert(frame_index, frame);
     }
 

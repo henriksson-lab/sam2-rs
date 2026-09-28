@@ -108,11 +108,47 @@ bounded previews without retaining an entire video in memory.
 
 ## Reproducible performance baseline
 
-Run `python3 tools/run_benchmarks.py` after following [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md). The generated table compares separate fresh CPU processes over an identical frozen real-image fixture; ratios below `1.0×` favor Rust. Use `--threads N` to cap Rayon and PyTorch to the same CPU-worker count; this is required when comparing thread-count tuning.
+CPU latency, host RSS, and output parity are the active performance scope.
+Ratios are Rust divided by pinned PyTorch; lower than `1.0×` favors Rust. The
+full P0/P1 scorecard is not complete yet, so the project does not claim overall
+CPU parity.
 
-For CUDA, run `python3 tools/run_gpu_benchmarks.py` on a CUDA-capable host. It writes a separate table and synchronizes device work around each timing sample; its RSS column is host `VmHWM`, not VRAM.
+| Representative current CPU evidence | Latency | Peak RSS | Status |
+| --- | ---: | ---: | --- |
+| Static image, one point, Tiny/20 workers | `0.889×` | `0.446×` | faster on this fixture only |
+| Cached prompt decode (`I3`) | `1.543×` clean; `1.360×` latest diagnostic | `0.322×` | latest layer-specific candidate fixes parity; speed and four-pair promotion remain open |
+| Batched/prior-mask decode (`I4`) | `1.600×` | `0.404×` | improved; speed fails and cars is narrowly noisy |
+| Video initialization (`V1`) | `0.919×` | `0.435×` | passes current cell gates |
+| Video propagation (`V2`) | `1.213×` | `0.583×` | clean row fails speed; latest `0.932×` candidate is noisy |
+| Practical automatic masks (`A1`) | `1.049×` | `0.566×` | cells pass; weighted target open |
+| Default-grid automatic masks (`A2`) | `0.927×` | `0.854×` | speed passes; weighted RSS open |
+| Model load (`L1`) | `0.132×` | `0.276×` | faster, but Python run was noisy |
+| Small-model first interaction (`S1`) | `1.047×` | `0.338×` | passes current cell gates |
+| Base-Plus/Large scaling (`M1`) | `1.012×` latest diagnostic | `0.515×` | both variants pass provisionally; four-pair promotion pending |
 
-The evidence and parity-gated optimization sequence are in [PERFORMANCE_INVESTIGATION.md](PERFORMANCE_INVESTIGATION.md).
+Run the model-free schema/timing/parity check first:
+
+```console
+python3 tools/run_parity_suite.py --validate-only
+```
+
+Pinned performance runs use `tools/run_parity_suite.py --device cpu` with the
+cell, fixture, 8/20-worker count, and four alternating process pairs selected
+as described in [CPU_PARITY_PLAN.md](CPU_PARITY_PLAN.md). Current row-level
+evidence and exact archive paths are in
+[CPU_PARITY_RESULTS.md](CPU_PARITY_RESULTS.md); accepted and rejected
+optimizations are in
+[PERFORMANCE_INVESTIGATION.md](PERFORMANCE_INVESTIGATION.md).
+
+The prior GPU suite is historical and outside the current completion gates. Its
+last complete eager result was `0.941×` weighted latency and `0.312×` host RSS;
+details remain archived in `CPU_PARITY_RESULTS.md`.
+
+### Historical early CPU baseline
+
+The generated `17.351×` row below predates the retained Candle and sam2-rs CPU
+optimizations. It is kept only to show the starting point and must not be read
+as current performance.
 
 <!-- BENCHMARK_RESULTS_START -->
 _Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz; fixture SHA-256: `24271176ecdc`. Peak RSS is Linux `VmHWM`._
@@ -122,7 +158,7 @@ _Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00
 | bedroom/00089.jpg, Tiny static point prompt (3 measured iterations) | 12606.34 | 726.56 | 17.351× | 1713.5 | 1434.2 | 1.195× | 4.50611e-05 |
 <!-- BENCHMARK_RESULTS_END -->
 
-### CPU stage-attribution diagnostic
+### Historical CPU stage-attribution diagnostic
 
 This one-iteration diagnostic is separate from the median baseline above. It
 uses the same warmed-up fixture and includes prompt encoding with the decoder.
@@ -164,7 +200,10 @@ The feature is still `10.75×` the one-iteration PyTorch CPU diagnostic, but
 its three global-attention blocks fall from about 1.5 s each to 0.53–0.55 s.
 Reproduce the full ratio table with `python3 tools/run_benchmarks.py --rust-features cpu-flash-attention`.
 
-## Reproducible experimental performance baseline
+## Historical experimental CPU baseline
+
+The following focused rows were useful during optimization but are not the
+current multi-scenario CPU scorecard above.
 
 <!-- BENCHMARK_EXPERIMENTAL_RESULTS_START -->
 _Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz; fixture SHA-256: `24271176ecdc`. CPU workers: `20`, pinned to CPUs `0-19`. Peak RSS is Linux `VmHWM`._
@@ -208,7 +247,7 @@ Mean peak RSS was 588.2 MiB versus 1582.1 MiB (`0.372×`), with maximum
 mask-logit error `2.90871e-05`. Reproduce with
 `python3 tools/run_benchmarks.py --iterations 5 --repeats 4 --threads 8 --cpu-list 0-7 --rust-features cpu-flash-attention,cpu-glibc-vector-math --no-write`.
 
-## Reproducible GPU performance baseline
+## Historical GPU performance baseline
 
 <!-- BENCHMARK_GPU_RESULTS_START -->
 _Generated on Linux 6.8.0-58-generic, CPU: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz. GPU: Quadro RTX 5000, 570.133.20. Fixture SHA-256: `24271176ecdc`. CPU workers: `implementation default`, alternating process order. Peak RSS is Linux `VmHWM`._

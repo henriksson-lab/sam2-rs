@@ -28,4 +28,4 @@ pub use mask::{
 };
 pub use mlp::{Activation, Mlp};
 pub use position_encoding::{PositionEmbeddingRandom, PositionEmbeddingSine};
-pub use rope::{apply_rotary, axial_frequencies};
+pub use rope::{apply_rotary, apply_rotary_repeated, axial_frequencies};

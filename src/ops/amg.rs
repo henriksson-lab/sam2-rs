@@ -328,6 +328,9 @@ pub fn uncrop_rle(
     if rle.width != x1 - x0 || rle.height != y1 - y0 {
         candle_core::bail!("RLE dimensions do not match crop box")
     }
+    if crop_box == [0, 0, original_width, original_height] {
+        return Ok(rle.clone());
+    }
     let local = rle.to_row_major_mask()?;
     let mut full = vec![false; original_width * original_height];
     for y in 0..rle.height {

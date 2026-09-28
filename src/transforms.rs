@@ -1,6 +1,134 @@
 //! SAM2 image/coordinate preprocessing and mask restoration utilities.
 
 use candle_core::{DType, Device, Result, Tensor, bail};
+use rayon::prelude::*;
+
+fn sparse_resize_weights(input: usize, output: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = output as f32 / input as f32;
+    let filter_scale = scale.min(1.);
+    let support = 1. / filter_scale;
+    (0..output)
+        .map(|out| {
+            let center = (out as f32 + 0.5) / scale - 0.5;
+            let start = (center - support).ceil() as isize;
+            let end = (center + support).floor() as isize;
+            let mut weights = (start..=end)
+                .filter(|&index| index >= 0 && (index as usize) < input)
+                .filter_map(|index| {
+                    let value = (1. - ((index as f32 - center) * filter_scale).abs()).max(0.);
+                    (value > 0.).then_some((index as usize, value))
+                })
+                .collect::<Vec<_>>();
+            let sum = weights.iter().map(|(_, value)| value).sum::<f32>();
+            for (_, value) in &mut weights {
+                *value /= sum;
+            }
+            weights
+        })
+        .collect()
+}
+
+fn resize_normalize_rgb8(
+    rgb_hwc: &[u8],
+    input_width: usize,
+    input_height: usize,
+    output: usize,
+) -> Vec<f32> {
+    let mut resized = vec![0f32; 3 * output * output];
+    resize_normalize_rgb8_into(rgb_hwc, input_width, input_height, output, &mut resized);
+    resized
+}
+
+fn resize_normalize_rgb8_into(
+    rgb_hwc: &[u8],
+    input_width: usize,
+    input_height: usize,
+    output: usize,
+    resized: &mut [f32],
+) {
+    assert_eq!(resized.len(), 3 * output * output);
+    let height_weights = sparse_resize_weights(input_height, output);
+    let width_weights = sparse_resize_weights(input_width, output);
+    let mut height = vec![0f32; 3 * output * input_width];
+    height
+        .par_chunks_mut(input_width)
+        .enumerate()
+        .for_each(|(channel_row, row)| {
+            let channel = channel_row / output;
+            let out_y = channel_row % output;
+            for (x, value) in row.iter_mut().enumerate() {
+                *value = height_weights[out_y]
+                    .iter()
+                    .map(|&(y, weight)| {
+                        rgb_hwc[(y * input_width + x) * 3 + channel] as f32 / 255. * weight
+                    })
+                    .sum();
+            }
+        });
+    let means = [0.485f32, 0.456, 0.406];
+    let stds = [0.229f32, 0.224, 0.225];
+    resized
+        .par_chunks_mut(output)
+        .enumerate()
+        .for_each(|(channel_row, row)| {
+            let channel = channel_row / output;
+            let out_y = channel_row % output;
+            let input_row = &height[(channel * output + out_y) * input_width
+                ..(channel * output + out_y + 1) * input_width];
+            for (out_x, value) in row.iter_mut().enumerate() {
+                let value_before_normalization = width_weights[out_x]
+                    .iter()
+                    .map(|&(x, weight)| input_row[x] * weight)
+                    .sum::<f32>();
+                *value = (value_before_normalization - means[channel]) / stds[channel];
+            }
+        });
+}
+
+/// Separable triangle-filter resize matching TorchVision's antialiased tensor
+/// bilinear path. Upscaling naturally reduces to ordinary bilinear sampling.
+pub(crate) fn antialiased_bilinear_resize(
+    input: &Tensor,
+    output_height: usize,
+    output_width: usize,
+) -> Result<Tensor> {
+    let (batch, channels, input_height, input_width) = input.dims4()?;
+    fn weights(input: usize, output: usize, device: &Device) -> Result<Tensor> {
+        let scale = output as f32 / input as f32;
+        let filter_scale = scale.min(1.);
+        let support = 1. / filter_scale;
+        let mut values = vec![0f32; output * input];
+        for out in 0..output {
+            let center = (out as f32 + 0.5) / scale - 0.5;
+            let start = (center - support).ceil() as isize;
+            let end = (center + support).floor() as isize;
+            let mut sum = 0f32;
+            for index in start..=end {
+                if index >= 0 && (index as usize) < input {
+                    let value = (1. - ((index as f32 - center) * filter_scale).abs()).max(0.);
+                    values[out * input + index as usize] = value;
+                    sum += value;
+                }
+            }
+            for index in 0..input {
+                values[out * input + index] /= sum;
+            }
+        }
+        Tensor::from_vec(values, (output, input), device)
+    }
+    let height_weights = weights(input_height, output_height, input.device())?;
+    let width_weights = weights(input_width, output_width, input.device())?;
+    let height = input
+        .permute((0, 1, 3, 2))?
+        .reshape((batch * channels * input_width, input_height))?
+        .matmul(&height_weights.t()?)?
+        .reshape((batch, channels, input_width, output_height))?
+        .permute((0, 1, 3, 2))?;
+    height
+        .reshape((batch * channels * output_height, input_width))?
+        .matmul(&width_weights.t()?)?
+        .reshape((batch, channels, output_height, output_width))
+}
 
 use crate::ops::connected_components_8;
 
@@ -106,26 +234,9 @@ impl Sam2ImageTransforms {
                 rgb_hwc.len()
             )
         }
-        let mut chw = vec![0f32; expected];
-        for y in 0..height {
-            for x in 0..width {
-                let source = (y * width + x) * 3;
-                let destination = y * width + x;
-                for channel in 0..3 {
-                    chw[channel * width * height + destination] =
-                        rgb_hwc[source + channel] as f32 / 255.;
-                }
-            }
-        }
-        let tensor = Tensor::from_vec(chw, (1, 3, height, width), device)?.upsample_bilinear2d(
-            self.resolution,
-            self.resolution,
-            false,
-        )?;
-        let mean = Tensor::from_vec(vec![0.485f32, 0.456, 0.406], (1, 3, 1, 1), device)?;
-        let std = Tensor::from_vec(vec![0.229f32, 0.224, 0.225], (1, 3, 1, 1), device)?;
+        let chw = resize_normalize_rgb8(rgb_hwc, width, height, self.resolution);
         Ok(PreparedImage {
-            tensor: tensor.broadcast_sub(&mean)?.broadcast_div(&std)?,
+            tensor: Tensor::from_vec(chw, (1, 3, self.resolution, self.resolution), device)?,
             geometry: ImageGeometry {
                 original_width: width,
                 original_height: height,
@@ -145,16 +256,65 @@ impl Sam2ImageTransforms {
         if images.is_empty() {
             bail!("image batch must not be empty")
         }
-        let prepared = images
-            .iter()
-            .map(|&(pixels, width, height)| self.prepare_rgb8(pixels, width, height, device))
-            .collect::<Result<Vec<_>>>()?;
-        let tensors = prepared
-            .iter()
-            .map(|image| &image.tensor)
-            .collect::<Vec<_>>();
-        let tensor = Tensor::cat(&tensors, 0)?;
-        let geometries = prepared.into_iter().map(|image| image.geometry).collect();
+        let frame_elements = 3 * self.resolution * self.resolution;
+        let mut geometries = Vec::with_capacity(images.len());
+        for &(pixels, width, height) in images {
+            if width == 0 || height == 0 {
+                bail!("SAM2 image dimensions must be non-zero")
+            }
+            let expected = width * height * 3;
+            if pixels.len() != expected {
+                bail!(
+                    "expected {expected} interleaved RGB bytes, got {}",
+                    pixels.len()
+                )
+            }
+            geometries.push(ImageGeometry {
+                original_width: width,
+                original_height: height,
+                resolution: self.resolution,
+            });
+        }
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = device {
+            use candle_core::{CudaStorage, Storage, op::BackpropOp};
+            // Allocate final device storage once, then reuse one normalized
+            // host-frame buffer and copy directly into each destination
+            // range. This avoids per-frame device allocations without
+            // retaining a second full-video host batch.
+            let mut device_values = unsafe { cuda.alloc::<f32>(images.len() * frame_elements)? };
+            let mut frame = vec![0f32; frame_elements];
+            for (index, &(pixels, width, height)) in images.iter().enumerate() {
+                resize_normalize_rgb8_into(pixels, width, height, self.resolution, &mut frame);
+                let start = index * frame_elements;
+                cuda.memcpy_htod(
+                    frame.as_slice(),
+                    &mut device_values.slice_mut(start..start + frame_elements),
+                )?;
+            }
+            let storage = CudaStorage::wrap_cuda_slice(device_values, cuda.clone());
+            let tensor = Tensor::from_storage(
+                Storage::Cuda(storage),
+                (images.len(), 3, self.resolution, self.resolution),
+                BackpropOp::none(),
+                false,
+            );
+            return Ok((tensor, geometries));
+        }
+        let mut values = vec![0f32; images.len() * frame_elements];
+        for (frame, &(pixels, width, height)) in
+            values.chunks_exact_mut(frame_elements).zip(images.iter())
+        {
+            resize_normalize_rgb8_into(pixels, width, height, self.resolution, frame);
+        }
+        // Match upstream forward_batch: one contiguous batch and one device
+        // storage. Callers can retain per-image narrow views without copying
+        // or allocating a separate storage buffer for every frame.
+        let tensor = Tensor::from_vec(
+            values,
+            (images.len(), 3, self.resolution, self.resolution),
+            device,
+        )?;
         Ok((tensor, geometries))
     }
 
@@ -263,6 +423,10 @@ impl Sam2ImageTransforms {
         }
         output.upsample_bilinear2d(original_height, original_width, false)
     }
+
+    pub(crate) fn has_mask_cleanup(&self) -> bool {
+        self.max_hole_area > 0 || self.max_sprinkle_area > 0
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +449,34 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!((values[0] - (1. - 0.485) / 0.229).abs() < 1e-5);
+    }
+
+    #[test]
+    fn forward_batch_matches_individual_preparation_without_frame_copies() {
+        let transforms = Sam2ImageTransforms::new(2);
+        let red_green = [255, 0, 0, 0, 255, 0];
+        let blue_white = [0, 0, 255, 255, 255, 255];
+        let images = [
+            (red_green.as_slice(), 2usize, 1usize),
+            (blue_white.as_slice(), 2usize, 1usize),
+        ];
+        let (batch, geometries) = transforms.forward_batch(&images, &Device::Cpu).unwrap();
+        assert_eq!(batch.dims(), &[2, 3, 2, 2]);
+        assert_eq!(geometries.len(), 2);
+        for (index, &(pixels, width, height)) in images.iter().enumerate() {
+            let expected = transforms
+                .prepare_rgb8(pixels, width, height, &Device::Cpu)
+                .unwrap();
+            let actual = batch.narrow(0, index, 1).unwrap();
+            assert_eq!(
+                actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                expected
+                    .tensor
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+        }
     }
 }

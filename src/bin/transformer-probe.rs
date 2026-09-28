@@ -30,12 +30,9 @@ fn main() -> ExitCode {
     let prompt_output = prompt_encoder
         .forward(Some((&points, &labels)), None, None)
         .unwrap();
-    let src = image_output
-        .vision_features
-        .broadcast_add(&prompt_output.dense_embeddings)
-        .unwrap();
     match transformer.forward(
-        &src,
+        &image_output.vision_features,
+        &prompt_output.dense_embeddings,
         &prompt_encoder.get_dense_pe().unwrap(),
         &prompt_output.sparse_embeddings,
     ) {

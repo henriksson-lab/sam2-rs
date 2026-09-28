@@ -6,7 +6,7 @@ import sys
 import argparse
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor" / "segment-anything-2"))
@@ -17,18 +17,27 @@ from sam2.build_sam import build_sam2  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("variant", nargs="?", default="tiny", choices=["tiny", "small", "base_plus", "large"])
-    variant = parser.parse_args().variant
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    variant = args.variant
     yaml_name = {"tiny": "t", "small": "s", "base_plus": "b+", "large": "l"}[variant]
     checkpoint = ROOT / "checkpoints" / f"sam2.1_hiera_{variant}.pt"
-    destination = ROOT / "checkpoints" / f"sam2.1_hiera_{variant}_parity.safetensors"
+    destination = args.output or ROOT / "checkpoints" / f"sam2.1_hiera_{variant}_parity.safetensors"
     # Match the Rust decoder's deterministic single-mask path. The upstream
     # builder otherwise injects an optional dynamic multimask fallback.
     model = build_sam2(f"configs/sam2.1/sam2.1_hiera_{yaml_name}.yaml", str(checkpoint), device="cpu", apply_postprocessing=False)
-    image = torch.zeros((1, 3, 1024, 1024), dtype=torch.float32)
-    points = torch.tensor([[[512.0, 512.0]]])
-    labels = torch.tensor([[1]], dtype=torch.int64)
+    if args.fixture:
+        fixture = load_file(str(args.fixture))
+        image, points, labels = fixture["image"], fixture["points"], fixture["labels"]
+    else:
+        image = torch.zeros((1, 3, 1024, 1024), dtype=torch.float32)
+        points = torch.tensor([[[512.0, 512.0]]])
+        labels = torch.tensor([[1]], dtype=torch.int64)
     with torch.inference_mode():
         image_output = model.forward_image(image)
+        if model.directly_add_no_mem_embed:
+            image_output["vision_features"] = image_output["vision_features"] + model.no_mem_embed.reshape(1, -1, 1, 1)
         sparse, dense = model.sam_prompt_encoder((points, labels), None, None)
         masks, ious, mask_tokens, obj_scores = model.sam_mask_decoder(
             image_output["vision_features"],

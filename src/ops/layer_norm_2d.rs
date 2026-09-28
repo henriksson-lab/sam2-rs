@@ -23,10 +23,46 @@ impl LayerNorm2d {
     /// Normalizes NCHW data across its channel dimension, preserving PyTorch's
     /// mean/subtract/square/mean/sqrt operation order.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(output) = self.forward_cpu_f32(x)? {
+        if let Some(output) = self.forward_cpu_f32(x, false)? {
+            return Ok(output);
+        }
+        if let Some(output) = self.forward_cuda_channels_last(x)? {
             return Ok(output);
         }
         self.forward_generic(x)
+    }
+
+    /// Normalize and apply exact GELU while the CPU output buffer is already
+    /// owned. This preserves channels-last storage and avoids a second full
+    /// tensor allocation for the mask upscaler.
+    pub fn forward_gelu(&self, x: &Tensor) -> Result<Tensor> {
+        if std::env::var_os("SAM2_CPU_LAYERNORM_GELU_FUSED").is_none_or(|value| value != "0")
+            && let Some(output) = self.forward_cpu_f32(x, true)?
+        {
+            return Ok(output);
+        }
+        self.forward(x)?.gelu_erf()
+    }
+
+    /// CUDA's fused LayerNorm reduces the contiguous last dimension. Pack one
+    /// channels-last copy, normalize it in one kernel, then expose the result
+    /// as a stride-only NCHW view. The following cuDNN convolution accepts that
+    /// layout directly, avoiding the generic path's seven image-sized tensors.
+    fn forward_cuda_channels_last(&self, x: &Tensor) -> Result<Option<Tensor>> {
+        if !x.device().is_cuda()
+            || std::env::var_os("SAM2_CUDA_LAYER_NORM_2D_LAST_DIM")
+                .is_some_and(|value| value == "0")
+        {
+            return Ok(None);
+        }
+        let (_, channels, _, _) = x.dims4()?;
+        if self.weight.dims1()? != channels || self.bias.dims1()? != channels {
+            return Ok(None);
+        }
+        let channels_last = x.permute((0, 2, 3, 1))?.contiguous()?;
+        let normalized =
+            candle_nn::ops::layer_norm(&channels_last, &self.weight, &self.bias, self.eps as f32)?;
+        Ok(Some(normalized.permute((0, 3, 1, 2))?))
     }
 
     fn forward_generic(&self, x: &Tensor) -> Result<Tensor> {
@@ -44,7 +80,7 @@ impl LayerNorm2d {
     /// One-pass CPU implementation of the NCHW channel normalization.  The
     /// generic expression creates seven full image-sized intermediates; here
     /// every output pixel is independent and needs just two channel reductions.
-    fn forward_cpu_f32(&self, x: &Tensor) -> Result<Option<Tensor>> {
+    fn forward_cpu_f32(&self, x: &Tensor, gelu: bool) -> Result<Option<Tensor>> {
         if !x.device().is_cpu() || x.dtype() != DType::F32 {
             return Ok(None);
         }
@@ -110,6 +146,9 @@ impl LayerNorm2d {
                 }
             }
         });
+        if gelu {
+            candle_core::op::gelu_erf_f32_inplace(&mut output);
+        }
         Ok(Some(Tensor::from_vec(
             output,
             (batch, channels, height, width),
@@ -140,7 +179,7 @@ mod tests {
             &device,
         )
         .unwrap();
-        let fused = norm.forward_cpu_f32(&input).unwrap().unwrap();
+        let fused = norm.forward_cpu_f32(&input, false).unwrap().unwrap();
         let generic = norm.forward_generic(&input).unwrap();
         let max_error = fused
             .flatten_all()
@@ -152,6 +191,25 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0f32, f32::max);
         assert!(max_error <= 1e-6, "max error {max_error}");
+
+        let fused_gelu = norm.forward_gelu(&input).unwrap();
+        let expected_gelu = generic.gelu_erf().unwrap();
+        let max_error = fused_gelu
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .zip(
+                expected_gelu
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            )
+            .map(|(left, right)| (left - right).abs())
+            .fold(0f32, f32::max);
+        assert!(max_error <= 1e-6, "GELU max error {max_error}");
     }
 
     #[test]
@@ -171,7 +229,7 @@ mod tests {
             &device,
         )
         .unwrap();
-        let fused = norm.forward_cpu_f32(&input).unwrap().unwrap();
+        let fused = norm.forward_cpu_f32(&input, false).unwrap().unwrap();
         let generic = norm.forward_generic(&input).unwrap();
         let max_error = fused
             .flatten_all()
