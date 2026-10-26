@@ -5,14 +5,30 @@ use std::{
     time::Instant,
 };
 
-use candle_core::{DType, Result, Storage, Tensor, TensorId, bail};
-use candle_nn::{LayerNorm, Linear, Module, VarBuilder, linear, ops::softmax_last_dim};
+use candle_core::{D, DType, Result, Storage, Tensor, TensorId, bail};
+use candle_nn::{
+    LayerNorm, Linear, Module, VarBuilder, linear,
+    ops::{softmax, softmax_last_dim},
+};
 use rayon::prelude::*;
 
 use crate::ops::{
     Activation, Mlp, apply_rotary, apply_rotary_repeated, axial_frequencies,
     layer_norm_add_residual,
 };
+
+fn layer_norm_differentiable(norm: &LayerNorm, input: &Tensor) -> Result<Tensor> {
+    let hidden = input.dim(D::Minus1)?;
+    let mean = (input.sum_keepdim(D::Minus1)? / hidden as f64)?;
+    let centered = input.broadcast_sub(&mean)?;
+    let variance = (centered.sqr()?.sum_keepdim(D::Minus1)? / hidden as f64)?;
+    let normalized = centered.broadcast_div(&(variance + norm.eps())?.sqrt()?)?;
+    let scaled = normalized.broadcast_mul(norm.weight())?;
+    match norm.bias() {
+        Some(bias) => scaled.broadcast_add(bias),
+        None => Ok(scaled),
+    }
+}
 
 fn profile_a2_transformer_token(stage: &str, queries: &Tensor) -> Result<()> {
     let values = queries
@@ -337,6 +353,25 @@ impl Attention {
             return Ok(output);
         }
         self.forward_impl(q, k, v, None)
+    }
+
+    /// Scaled dot-product attention built only from operations that implement backward.
+    pub fn forward_differentiable(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let q = self
+            .separate_heads(&self.q_proj.forward(q)?)?
+            .contiguous()?;
+        let k = self
+            .separate_heads(&self.k_proj.forward(k)?)?
+            .contiguous()?;
+        let v = self
+            .separate_heads(&self.v_proj.forward(v)?)?
+            .contiguous()?;
+        let dim = self.internal_dim / self.num_heads;
+        let scores = q
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?
+            .affine(1. / (dim as f64).sqrt(), 0.)?;
+        let attended = softmax(&scores, D::Minus1)?.matmul(&v)?;
+        self.out_proj.forward(&self.recombine_heads(&attended)?)
     }
 
     fn forward_profiled(
@@ -1009,6 +1044,47 @@ impl TwoWayAttentionBlock {
         Ok((queries, keys))
     }
 
+    fn forward_differentiable(
+        &self,
+        queries: &Tensor,
+        keys: &Tensor,
+        query_pe: &Tensor,
+        key_pe: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut queries = if self.skip_first_layer_pe {
+            self.self_attn
+                .forward_differentiable(queries, queries, queries)?
+        } else {
+            let q = queries.broadcast_add(query_pe)?;
+            queries.broadcast_add(&self.self_attn.forward_differentiable(&q, &q, queries)?)?
+        };
+        queries = layer_norm_differentiable(&self.norm1, &queries)?;
+        let q = queries.broadcast_add(query_pe)?;
+        let image_with_pe = keys.broadcast_add(key_pe)?;
+        queries = layer_norm_differentiable(
+            &self.norm2,
+            &queries.broadcast_add(&self.cross_attn_token_to_image.forward_differentiable(
+                &q,
+                &image_with_pe,
+                keys,
+            )?)?,
+        )?;
+        queries = layer_norm_differentiable(
+            &self.norm3,
+            &queries.broadcast_add(&self.mlp.forward(&queries)?)?,
+        )?;
+        let q = queries.broadcast_add(query_pe)?;
+        let keys = layer_norm_differentiable(
+            &self.norm4,
+            &keys.broadcast_add(&self.cross_attn_image_to_token.forward_differentiable(
+                &image_with_pe,
+                &q,
+                &queries,
+            )?)?,
+        )?;
+        Ok((queries, keys))
+    }
+
     fn forward_profiled(
         &self,
         queries: &Tensor,
@@ -1266,6 +1342,37 @@ impl TwoWayTransformer {
         }
         profile_stage!("final_attention");
         let _ = profile_start;
+        Ok((queries, keys))
+    }
+
+    /// Reference two-way transformer equations without inference caches or no-backward kernels.
+    pub fn forward_differentiable(
+        &self,
+        image_embedding: &Tensor,
+        dense_prompt_embedding: &Tensor,
+        image_pe: &Tensor,
+        point_embedding: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut keys = image_tokens_nhwc(
+            &image_embedding.broadcast_add(dense_prompt_embedding)?,
+            false,
+        )?
+        .contiguous()?;
+        let image_pe = image_tokens_nhwc(image_pe, false)?.contiguous()?;
+        let mut queries = point_embedding.clone();
+        for layer in &self.layers {
+            (queries, keys) =
+                layer.forward_differentiable(&queries, &keys, point_embedding, &image_pe)?;
+        }
+        let q = queries.broadcast_add(point_embedding)?;
+        let k = keys.broadcast_add(&image_pe)?;
+        let final_attention = self
+            .final_attn_token_to_image
+            .forward_differentiable(&q, &k, &keys)?;
+        queries = layer_norm_differentiable(
+            &self.norm_final_attn,
+            &queries.broadcast_add(&final_attention)?,
+        )?;
         Ok((queries, keys))
     }
 

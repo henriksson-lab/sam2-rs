@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{
-    Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, VarBuilder, conv_transpose2d,
-    conv2d,
+    Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Module, VarBuilder,
+    conv_transpose2d, conv2d,
 };
 
 use crate::{
@@ -499,6 +499,95 @@ impl MaskDecoder {
             high_res_features,
             false,
         )
+    }
+
+    /// Upstream decoder equations using only operations with Candle backward implementations.
+    /// Frozen image and prompt embeddings may be detached by the caller. Dynamic multimask
+    /// selection is an inference policy, so training returns token zero for single-mask output.
+    pub fn forward_differentiable(
+        &self,
+        image_embeddings: &Tensor,
+        image_pe: &Tensor,
+        sparse_prompt_embeddings: &Tensor,
+        dense_prompt_embeddings: &Tensor,
+        multimask_output: bool,
+        high_res_features: &[Tensor],
+    ) -> Result<MaskDecoderOutput> {
+        if high_res_features.len() != 2 {
+            candle_core::bail!("SAM2 mask decoder needs two high-resolution features")
+        }
+        let batch = sparse_prompt_embeddings.dim(0)?;
+        let output_tokens = Tensor::cat(
+            &[&self.obj_score_token, &self.iou_token, &self.mask_tokens],
+            0,
+        )?
+        .unsqueeze(0)?
+        .broadcast_as((batch, 6usize, 256usize))?;
+        let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
+        let position = Self::position_for_batch(image_pe, batch)?;
+        let (hs, src) = self.transformer.forward_differentiable(
+            image_embeddings,
+            dense_prompt_embeddings,
+            &position,
+            &tokens,
+        )?;
+        let iou_token_out = hs.narrow(1, 1, 1)?.squeeze(1)?;
+        let all_mask_tokens = hs.narrow(1, 2, 4)?;
+        let object_score_logits = self
+            .object_score_head
+            .forward(&hs.narrow(1, 0, 1)?.squeeze(1)?)?;
+        let (_, channels, height, width) = image_embeddings.dims4()?;
+        let src = src
+            .permute((0, 2, 1))?
+            .contiguous()?
+            .reshape((batch, channels, height, width))?;
+        let skip_1 = self.conv_s1.forward(&high_res_features[1])?;
+        let upscaled = self.upconv_0.forward(&src)?.broadcast_add(&skip_1)?;
+        let upscaled = self
+            .upnorm_1
+            .forward_differentiable(&upscaled)?
+            .gelu_erf()?;
+        let skip_0 = self.conv_s0.forward(&high_res_features[0])?;
+        let upscaled = self
+            .upconv_3
+            .forward(&upscaled)?
+            .broadcast_add(&skip_0)?
+            .gelu_erf()?;
+        let mut hyper = Vec::with_capacity(4);
+        for (index, network) in self.hypernetworks.iter().enumerate() {
+            hyper.push(network.forward(&all_mask_tokens.narrow(1, index, 1)?.squeeze(1)?)?);
+        }
+        let hyper = Tensor::stack(&hyper.iter().collect::<Vec<_>>(), 1)?;
+        let (_, up_channels, up_height, up_width) = upscaled.dims4()?;
+        let all_masks = hyper
+            .matmul(
+                &upscaled
+                    .contiguous()?
+                    .reshape((batch, up_channels, up_height * up_width))?,
+            )?
+            .reshape((batch, 4usize, up_height, up_width))?;
+        let all_iou_predictions = self.iou_head.forward(&iou_token_out)?;
+        let (masks, iou_predictions, mask_tokens) = if multimask_output {
+            (
+                all_masks.narrow(1, 1, 3)?,
+                all_iou_predictions.narrow(1, 1, 3)?,
+                all_mask_tokens.narrow(1, 1, 3)?,
+            )
+        } else {
+            (
+                all_masks.narrow(1, 0, 1)?,
+                all_iou_predictions.narrow(1, 0, 1)?,
+                all_mask_tokens.narrow(1, 0, 1)?,
+            )
+        };
+        Ok(MaskDecoderOutput {
+            masks,
+            iou_predictions,
+            mask_tokens,
+            object_score_logits,
+            upscaled_embedding: upscaled,
+            hyper_in: hyper,
+        })
     }
 
     /// Project the two high-resolution skips once per encoded image, as in

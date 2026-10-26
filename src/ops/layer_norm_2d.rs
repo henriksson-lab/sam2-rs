@@ -77,6 +77,12 @@ impl LayerNorm2d {
         normalized.broadcast_mul(&weight)?.broadcast_add(&bias)
     }
 
+    /// The translated equation using only Candle operations with backward implementations.
+    /// Training calls this explicitly; inference retains its optimized device-specific paths.
+    pub fn forward_differentiable(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_generic(x)
+    }
+
     /// One-pass CPU implementation of the NCHW channel normalization.  The
     /// generic expression creates seven full image-sized intermediates; here
     /// every output pixel is independent and needs just two channel reductions.

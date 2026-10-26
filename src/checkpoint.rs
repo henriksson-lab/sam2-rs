@@ -48,6 +48,24 @@ pub fn validate_sam2_1(path: impl AsRef<Path>, variant: Sam2Variant) -> candle_c
         .map_err(|error| candle_core::Error::Msg(error.to_string()))
 }
 
+/// Validate a decoder-only child checkpoint emitted by native fine-tuning. It must contain every
+/// translated `sam_mask_decoder.*` tensor with its upstream shape and no unrelated tensors.
+pub fn validate_sam2_1_mask_decoder(
+    path: impl AsRef<Path>,
+    variant: Sam2Variant,
+) -> candle_core::Result<()> {
+    let decoder = CheckpointManifest::new(
+        CheckpointManifest::sam2_1(variant)
+            .required()
+            .iter()
+            .filter(|tensor| tensor.key.starts_with("sam_mask_decoder."))
+            .cloned(),
+    );
+    CheckpointIndex::from_path(path)
+        .and_then(|index| index.validate(&decoder))
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
     pub shape: Vec<usize>,

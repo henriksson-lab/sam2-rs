@@ -322,6 +322,27 @@ struct CachedImages {
     is_batch: bool,
 }
 
+/// Detached encoding of one preprocessed image. Model-family training and persistent-cache policy
+/// stay outside sam2-rs; this value only exposes the faithful translated encoder boundary.
+#[derive(Clone, Debug)]
+pub struct EncodedImage {
+    features: BackboneOutput,
+    geometry: crate::ImageGeometry,
+}
+
+impl EncodedImage {
+    pub fn estimated_bytes(&self) -> u64 {
+        let bytes = |tensor: &Tensor| {
+            tensor
+                .elem_count()
+                .saturating_mul(tensor.dtype().size_in_bytes()) as u64
+        };
+        bytes(&self.features.vision_features)
+            .saturating_add(self.features.vision_pos_enc.iter().map(bytes).sum::<u64>())
+            .saturating_add(self.features.backbone_fpn.iter().map(bytes).sum::<u64>())
+    }
+}
+
 /// Tensor-native prompt batch for cached image prediction. Coordinates and
 /// boxes may be normalized from original pixels or supplied directly in model
 /// coordinates. Leading batch dimensions allow several prompt sets to reuse
@@ -1639,6 +1660,46 @@ impl Sam2ImagePredictor {
         )
     }
 
+    /// Load frozen encoder and prompt weights from a complete parent checkpoint while replacing
+    /// only the mask decoder with a validated decoder-only child artifact. This keeps fine-tuned
+    /// revisions explicit and avoids rewriting or duplicating their immutable parent checkpoint.
+    pub fn load_sam2_1_with_mask_decoder_on_device(
+        variant: Sam2Variant,
+        parent_checkpoint: impl AsRef<Path>,
+        decoder_checkpoint: impl AsRef<Path>,
+        device: &Device,
+    ) -> Result<Self> {
+        let parent_checkpoint = parent_checkpoint.as_ref();
+        let decoder_checkpoint = decoder_checkpoint.as_ref();
+        crate::checkpoint::validate_sam2_1(parent_checkpoint, variant)?;
+        crate::checkpoint::validate_sam2_1_mask_decoder(decoder_checkpoint, variant)?;
+        if device.is_cpu() {
+            crate::cpu_allocator::configure_cpu_allocator_for_inference();
+        }
+        crate::cuda_allocator::configure_cuda_allocator_for_inference(device)?;
+        let parent = crate::checkpoint::load_var_builder(parent_checkpoint, DType::F32, device)?;
+        let decoder = crate::checkpoint::load_var_builder(decoder_checkpoint, DType::F32, device)?;
+        let config = Sam2Config::sam2_1(variant);
+        let predictor_config = ImagePredictorConfig::default();
+        Ok(Self {
+            device: device.clone(),
+            image_encoder: ImageEncoder::load(&config, parent.pp("image_encoder"))?,
+            prompt_encoder: PromptEncoder::load(&config, parent.pp("sam_prompt_encoder"))?,
+            mask_decoder: MaskDecoder::load_with_config(
+                decoder.pp("sam_mask_decoder"),
+                predictor_config.decoder,
+            )?,
+            no_mem_embed: parent.get((1, 1, 256), "no_mem_embed")?,
+            transforms: Sam2ImageTransforms::with_postprocessing(
+                config.image_size,
+                predictor_config.mask_threshold,
+                predictor_config.max_hole_area,
+                predictor_config.max_sprinkle_area,
+            ),
+            cached_images: None,
+        })
+    }
+
     pub fn load_sam2_1_on_device_with_config(
         variant: Sam2Variant,
         path: impl AsRef<Path>,
@@ -1691,17 +1752,29 @@ impl Sam2ImagePredictor {
 
     /// Caches one RGB8 image embedding for repeated prompt decoding.
     pub fn set_image(&mut self, rgb_hwc: &[u8], width: usize, height: usize) -> Result<()> {
-        self.reset_predictor();
+        let encoded = self.encode_rgb8(rgb_hwc, width, height)?;
+        self.set_encoded_image(&encoded);
+        Ok(())
+    }
+
+    pub fn encode_rgb8(&self, rgb_hwc: &[u8], width: usize, height: usize) -> Result<EncodedImage> {
         let prepared = self
             .transforms
             .prepare_rgb8(rgb_hwc, width, height, &self.device)?;
         let features = self.encode_image(&prepared.tensor)?;
-        self.cached_images = Some(CachedImages {
+        Ok(EncodedImage {
             features,
-            geometries: vec![prepared.geometry],
+            geometry: prepared.geometry,
+        })
+    }
+
+    pub fn set_encoded_image(&mut self, encoded: &EncodedImage) {
+        self.reset_predictor();
+        self.cached_images = Some(CachedImages {
+            features: encoded.features.clone(),
+            geometries: vec![encoded.geometry],
             is_batch: false,
         });
-        Ok(())
     }
 
     /// Decodes an image file and caches its image embedding.
@@ -1831,6 +1904,60 @@ impl Sam2ImagePredictor {
             })
             .transpose()?;
         Ok((coordinates, labels, boxes, mask))
+    }
+
+    /// Prepare detached upstream encoder and prompt outputs for a Blockflow-owned decoder
+    /// training step. This exposes translated data flow, without adding losses or optimizer
+    /// policy to sam2-rs.
+    pub fn frozen_decoder_inputs(
+        &self,
+        image_index: usize,
+        prompts: &ImagePromptBatch,
+    ) -> Result<crate::FrozenDecoderInputs> {
+        let (features, geometry) = self.cached_features(image_index)?;
+        let (coordinates, labels, boxes, mask_input) =
+            self.prepare_cached_prompts(prompts, geometry)?;
+        let (coordinates, labels) = match (coordinates, labels, boxes) {
+            (coordinates, labels, Some(boxes)) => {
+                let batch = boxes.dim(0)?;
+                let box_coords = boxes.reshape((batch, 2, 2))?;
+                let box_labels = Tensor::new(&[2i64, 3], &self.device)?
+                    .unsqueeze(0)?
+                    .broadcast_as((batch, 2))?;
+                match (coordinates, labels) {
+                    (Some(coordinates), Some(labels)) => (
+                        Some(Tensor::cat(&[&box_coords, &coordinates], 1)?),
+                        Some(Tensor::cat(&[&box_labels, &labels], 1)?),
+                    ),
+                    (None, None) => (Some(box_coords), Some(box_labels)),
+                    _ => candle_core::bail!("point coordinates and labels must match"),
+                }
+            }
+            (Some(coordinates), Some(labels), None) => (Some(coordinates), Some(labels)),
+            (None, None, None) => (None, None),
+            _ => candle_core::bail!("point coordinates and labels must match"),
+        };
+        let prompt_embeddings = self.prompt_encoder.forward(
+            coordinates.as_ref().zip(labels.as_ref()),
+            None,
+            mask_input.as_ref(),
+        )?;
+        let high_res_features: [Tensor; 2] = features.backbone_fpn[..2]
+            .iter()
+            .map(Tensor::detach)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| {
+                candle_core::Error::Msg("SAM2 encoder returned the wrong FPN count".into())
+            })?;
+        Ok(crate::FrozenDecoderInputs {
+            image_embeddings: features.vision_features.detach(),
+            image_pe: self.prompt_encoder.get_dense_pe()?.detach(),
+            sparse_prompt_embeddings: prompt_embeddings.sparse_embeddings.detach(),
+            dense_prompt_embeddings: prompt_embeddings.dense_embeddings.detach(),
+            high_res_features,
+            geometry,
+        })
     }
 
     fn decode_prepared_cached(
@@ -1966,6 +2093,77 @@ impl Sam2ImagePredictor {
             candle_core::bail!("use predict_batch for a cached image batch")
         }
         self.predict_cached_index(0, prompts, multimask_output, return_logits)
+    }
+
+    /// Decode ordinary pixel-coordinate prompts against the currently cached image embedding.
+    ///
+    /// This is the allocation boundary needed by viewers and workflow engines: callers retain
+    /// plain Rust prompt data and do not need a direct Candle dependency merely to construct the
+    /// four small tensors accepted by [`Self::predict_cached`]. `mask_input`, when supplied, is a
+    /// single low-resolution logit plane in row-major order.
+    pub fn predict_cached_prompts(
+        &self,
+        points: &[PointPrompt],
+        bounding_box: Option<BoxPrompt>,
+        mask_input: Option<(&[f32], usize, usize)>,
+        multimask_output: bool,
+        return_logits: bool,
+    ) -> Result<ImagePrediction> {
+        let point_coords = if points.is_empty() {
+            None
+        } else {
+            Some(Tensor::from_vec(
+                points
+                    .iter()
+                    .flat_map(|point| [point.x, point.y])
+                    .collect::<Vec<_>>(),
+                (points.len(), 2),
+                &self.device,
+            )?)
+        };
+        let point_labels = if points.is_empty() {
+            None
+        } else {
+            Some(Tensor::from_vec(
+                points
+                    .iter()
+                    .map(|point| if point.positive { 1_i64 } else { 0_i64 })
+                    .collect::<Vec<_>>(),
+                points.len(),
+                &self.device,
+            )?)
+        };
+        let boxes = bounding_box
+            .map(|bounds| {
+                Tensor::from_vec(
+                    vec![bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                    (1, 4),
+                    &self.device,
+                )
+            })
+            .transpose()?;
+        let mask_input = mask_input
+            .map(|(values, height, width)| {
+                if values.len() != height.saturating_mul(width) {
+                    candle_core::bail!(
+                        "mask input has {} values, expected {height}x{width}",
+                        values.len()
+                    )
+                }
+                Tensor::from_vec(values.to_vec(), (1, height, width), &self.device)
+            })
+            .transpose()?;
+        self.predict_cached(
+            &ImagePromptBatch {
+                point_coords,
+                point_labels,
+                boxes,
+                mask_input,
+                normalize_coords: true,
+            },
+            multimask_output,
+            return_logits,
+        )
     }
 
     /// Decodes one prompt batch per cached image. The backbone is not rerun.

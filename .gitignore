@@ -27,3 +27,7 @@ venv/
 .coverage.*
 coverage.xml
 htmlcov/
+
+# Local upstream/reference checkouts, not crate source.
+/segment-anything/
+/vendor/
