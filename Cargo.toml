@@ -9,8 +9,8 @@ license = "Apache-2.0"
 [dependencies]
 # Pin the tested CPU/training Candle revision without a sibling checkout.
 # All consumers must use this same source identity for Candle tensor types.
-candle-core = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
-candle-nn = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
+candle-core = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
+candle-nn = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
 safetensors = "0.8.0"
 thiserror = "2"
 rayon = "1.11"

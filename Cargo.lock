@@ -156,7 +156,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/mahogny/candle.git?rev=b27e8c7c04d16c19d335325d7abd6331254c58a2#b27e8c7c04d16c19d335325d7abd6331254c58a2"
+source = "git+https://github.com/mahogny/candle.git?rev=0998c8c655ae84330149ddbff509916254b887a1#0998c8c655ae84330149ddbff509916254b887a1"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/mahogny/candle.git?rev=b27e8c7c04d16c19d335325d7abd6331254c58a2#b27e8c7c04d16c19d335325d7abd6331254c58a2"
+source = "git+https://github.com/mahogny/candle.git?rev=0998c8c655ae84330149ddbff509916254b887a1#0998c8c655ae84330149ddbff509916254b887a1"
 dependencies = [
  "cudaforge",
 ]
@@ -193,7 +193,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/mahogny/candle.git?rev=b27e8c7c04d16c19d335325d7abd6331254c58a2#b27e8c7c04d16c19d335325d7abd6331254c58a2"
+source = "git+https://github.com/mahogny/candle.git?rev=0998c8c655ae84330149ddbff509916254b887a1#0998c8c655ae84330149ddbff509916254b887a1"
 dependencies = [
  "candle-core",
  "gemm 0.19.0",
@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/mahogny/candle.git?rev=b27e8c7c04d16c19d335325d7abd6331254c58a2#b27e8c7c04d16c19d335325d7abd6331254c58a2"
+source = "git+https://github.com/mahogny/candle.git?rev=0998c8c655ae84330149ddbff509916254b887a1#0998c8c655ae84330149ddbff509916254b887a1"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -770,7 +770,7 @@ dependencies = [
 [[package]]
 name = "gemm"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-c32 0.19.0",
@@ -804,7 +804,7 @@ dependencies = [
 [[package]]
 name = "gemm-c32"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-common 0.19.0",
@@ -833,7 +833,7 @@ dependencies = [
 [[package]]
 name = "gemm-c64"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-common 0.19.0",
@@ -868,7 +868,7 @@ dependencies = [
 [[package]]
 name = "gemm-common"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "bytemuck",
  "dyn-stack",
@@ -906,7 +906,7 @@ dependencies = [
 [[package]]
 name = "gemm-f16"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-common 0.19.0",
@@ -938,7 +938,7 @@ dependencies = [
 [[package]]
 name = "gemm-f32"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-common 0.19.0",
@@ -967,7 +967,7 @@ dependencies = [
 [[package]]
 name = "gemm-f64"
 version = "0.19.0"
-source = "git+https://github.com/henriksson-lab/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
+source = "git+https://github.com/mahogny/gemm.git?rev=a9ea398a74911f4a0cc79261044cbdf4ce9efd91#a9ea398a74911f4a0cc79261044cbdf4ce9efd91"
 dependencies = [
  "dyn-stack",
  "gemm-common 0.19.0",
